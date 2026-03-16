@@ -231,14 +231,17 @@ where
             UnembedMode::Skip
         };
 
-        let logits = self.model.infer(
-            contexts,
-            Some(context_masks),
-            &mut embedded_token_shift_for_time_mix,
-            &mut state,
-            &mut embedded_token_shift_for_channel_mix,
-            unembed_mode,
-        );
+        let logits = {
+            rwkv_bench::trace_lite_scope!("rwkv.infer.executor.model_infer");
+            self.model.infer(
+                contexts,
+                Some(context_masks),
+                &mut embedded_token_shift_for_time_mix,
+                &mut state,
+                &mut embedded_token_shift_for_channel_mix,
+                unembed_mode,
+            )
+        };
 
         let batch_masks_2d = batch_masks.clone().unsqueeze_dim::<2>(1);
         let batch_masks_4d = batch_masks
@@ -384,6 +387,7 @@ where
     }
 
     fn reset(&mut self, batch_index: usize) -> Result<()> {
+        rwkv_bench::trace_lite_scope!("rwkv.infer.executor.reset_slot");
         if batch_index >= self.max_batch_size {
             return Err(Error::BadRequest(format!(
                 "reset: batch_index {batch_index} out of range (max_batch_size={})",

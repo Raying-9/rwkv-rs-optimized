@@ -1,6 +1,5 @@
-use burn::backend::wgpu::{BoolElement, CubeBackend, FloatElement, IntElement};
 use burn::tensor::ops::FloatTensor;
-use burn_cubecl::{CubeElement, CubeRuntime};
+use burn_cubecl::{BoolElement, CubeBackend, CubeElement, CubeRuntime, FloatElement, IntElement};
 
 use crate::kernels::wkv7_common::{
     Wkv7BackwardOutput, Wkv7ForwardOutput,

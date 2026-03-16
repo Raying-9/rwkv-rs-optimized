@@ -9,8 +9,20 @@ use burn::{
 use crate::functions::{
     context_mask::apply_context_mask,
     init_weights::{get_token_shift_diff_scale, uniform_init, zeros_init},
-    token_shift::{get_embedded_token_shift, token_shift},
+    token_shift::{get_embedded_token_shift, token_shift_diff},
 };
+
+#[cfg(feature = "trace")]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {
+        let _rwkv_trace_scope = tracing::trace_span!($name).entered();
+    };
+}
+
+#[cfg(not(feature = "trace"))]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {};
+}
 
 #[derive(Config, Debug)]
 pub struct ChannelMixerConfig {
@@ -83,30 +95,55 @@ impl<B: Backend> ChannelMixer<B> {
         // `context_mask` handles physical left padding (and inactive lanes for batching).
         // Padding timesteps must be strict no-ops for the token-shift state; otherwise the
         // first real token would see an incorrect previous token.
-        let embedded_context = apply_context_mask(embedded_context, context_mask.clone());
+        let embedded_context = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.apply_context_mask");
+            apply_context_mask(embedded_context, context_mask.clone())
+        };
 
         // Left-padding guarantees the last timestep is always valid (per lane), so no gating.
-        let output_embedded_token_shift = embedded_token_shift
-            .as_ref()
-            .map(|_| get_embedded_token_shift(embedded_context.clone()));
+        let output_embedded_token_shift = embedded_token_shift.as_ref().map(|_| {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.output_shift");
+            get_embedded_token_shift(embedded_context.clone())
+        });
 
-        let prev = token_shift(
-            embedded_context.clone(),
-            embedded_token_shift,
-            context_mask.clone(),
-        );
-        let mut token_shifted_diff = prev - embedded_context.clone();
-        if let Some(mask) = context_mask.clone() {
-            token_shifted_diff = token_shifted_diff * mask.unsqueeze_dim(2);
-        }
+        let [_, context_length, _] = embedded_context.dims();
+        let token_shifted_diff = {
+            #[cfg(feature = "trace")]
+            let _token_shift_scope = tracing::trace_span!(
+                "rwkv.infer.model.channel_mixer.token_shift_diff",
+                cell_id = self.cell_id,
+                context_length
+            )
+            .entered();
+            token_shift_diff(
+                embedded_context.clone(),
+                embedded_token_shift,
+                context_mask.clone(),
+            )
+        };
 
-        let embedded_context_shift =
-            embedded_context.clone() + token_shifted_diff * self.token_shift_diff_scale.val();
+        let embedded_context_shift = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.shift_mix");
+            embedded_context.clone() + token_shifted_diff * self.token_shift_diff_scale.val()
+        };
 
-        let activated_key = relu(self.key.forward(embedded_context_shift)).powf_scalar(2.0);
+        let activated_key = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.projection_key");
+            self.key.forward(embedded_context_shift)
+        };
+        let activated_key = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.activation");
+            relu(activated_key).powf_scalar(2.0)
+        };
 
-        let value = self.value.forward(activated_key);
-        let value = apply_context_mask(value, context_mask.clone());
+        let value = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.projection_value");
+            self.value.forward(activated_key)
+        };
+        let value = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.output_mask");
+            apply_context_mask(value, context_mask.clone())
+        };
 
         ChannelMixerIO {
             embedded_context: value,

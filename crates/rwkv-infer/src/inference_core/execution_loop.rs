@@ -273,19 +273,25 @@ impl InferenceExecutionLoop {
     }
 
     fn handle_submit_batch(&mut self, submits: Vec<PendingSubmit>) {
+        rwkv_bench::trace_scope!("rwkv.infer.execution_loop.handle_submit_batch");
         if submits.is_empty() {
             return;
         }
 
-        let tokenize_start = Instant::now();
-        let texts: Vec<String> = submits
-            .iter()
-            .map(|submit| submit.input_text.clone())
-            .collect();
-        let tokenized: Vec<Vec<u16>> = self.tokenizer.encode_batch(texts, false);
-        let tokenize_ms = tokenize_start.elapsed().as_millis() as u64;
+        let (tokenized, tokenize_ms) = {
+            rwkv_bench::trace_lite_scope!("rwkv.infer.execution_loop.tokenize_batch");
+            let tokenize_start = Instant::now();
+            let texts: Vec<String> = submits
+                .iter()
+                .map(|submit| submit.input_text.clone())
+                .collect();
+            let tokenized: Vec<Vec<u16>> = self.tokenizer.encode_batch(texts, false);
+            let tokenize_ms = tokenize_start.elapsed().as_millis() as u64;
+            (tokenized, tokenize_ms)
+        };
 
         for (submit, token_ids_u16) in submits.into_iter().zip(tokenized.into_iter()) {
+            rwkv_bench::trace_lite_scope!("rwkv.infer.execution_loop.register_request");
             let token_ids: Vec<i32> = token_ids_u16.into_iter().map(i32::from).collect();
             if token_ids.len() > self.cfg.max_context_len {
                 let _ = submit.reply.send(InferenceSubmitResult::Error {
@@ -379,6 +385,7 @@ impl InferenceExecutionLoop {
     }
 
     fn tick_once(&mut self) -> bool {
+        rwkv_bench::trace_scope!("rwkv.infer.execution_loop.tick");
         let step = self.scheduler.schedule(&mut self.entries);
         if !step.has_work() {
             return false;
@@ -398,6 +405,7 @@ impl InferenceExecutionLoop {
     }
 
     fn run_prefill_without_output(&mut self, entry_ids: &[EntryId]) {
+        rwkv_bench::trace_scope!("rwkv.infer.execution_loop.prefill_without_output");
         let batch = self.build_prefill_batch(entry_ids, false);
         if batch.is_empty() {
             return;
@@ -412,6 +420,7 @@ impl InferenceExecutionLoop {
     }
 
     fn run_prefill(&mut self, entry_ids: &[EntryId]) {
+        rwkv_bench::trace_scope!("rwkv.infer.execution_loop.prefill_sample");
         let batch = self.build_prefill_batch(entry_ids, true);
         if batch.is_empty() {
             return;
@@ -434,6 +443,7 @@ impl InferenceExecutionLoop {
     }
 
     fn build_prefill_batch(&mut self, entry_ids: &[EntryId], need_sample: bool) -> ForwardBatch {
+        rwkv_bench::trace_lite_scope!("rwkv.infer.execution_loop.build_prefill_batch");
         let mut batch = ForwardBatch::default();
         let paragraph_len = self.cfg.paragraph_len;
 
@@ -489,6 +499,7 @@ impl InferenceExecutionLoop {
     }
 
     fn run_decode(&mut self, decode_ids: &[EntryId]) {
+        rwkv_bench::trace_scope!("rwkv.infer.execution_loop.decode");
         if decode_ids.is_empty() {
             return;
         }
@@ -537,6 +548,7 @@ impl InferenceExecutionLoop {
         batch: &ForwardBatch,
         need_sample: bool,
     ) -> crate::Result<Vec<SampledToken>> {
+        rwkv_bench::trace_lite_scope!("rwkv.infer.execution_loop.forward_batch");
         let contexts_ref: Vec<&[i32]> = batch.contexts.iter().map(Vec::as_slice).collect();
         let masks_ref: Vec<&[u8]> = batch.context_masks.iter().map(Vec::as_slice).collect();
         self.executor.forward(
@@ -555,6 +567,7 @@ impl InferenceExecutionLoop {
         batch_to_entry: &HashMap<usize, EntryId>,
         source: SampleSource,
     ) {
+        rwkv_bench::trace_lite_scope!("rwkv.infer.execution_loop.apply_sampled_tokens");
         let mut seen_batch_indices = HashSet::new();
         for sampled_token in sampled_tokens {
             let batch_index = sampled_token.batch_index;
@@ -590,6 +603,7 @@ impl InferenceExecutionLoop {
         sampled_token: SampledToken,
         source: SampleSource,
     ) -> Option<SampleApplyOutcome> {
+        rwkv_bench::trace_lite_scope!("rwkv.infer.execution_loop.prepare_sampled_token");
         let mut output_token = None;
         let mut finish_meta = None;
         let mut finished_batch_index = None;
@@ -649,6 +663,7 @@ impl InferenceExecutionLoop {
     }
 
     fn emit_sampled_token_outcome(&mut self, outcome: SampleApplyOutcome) {
+        rwkv_bench::trace_lite_scope!("rwkv.infer.execution_loop.emit_sampled_token");
         let SampleApplyOutcome {
             entry_id,
             output_token,

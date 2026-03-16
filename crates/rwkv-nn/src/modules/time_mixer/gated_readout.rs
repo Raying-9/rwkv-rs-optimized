@@ -10,6 +10,18 @@ use crate::{
     layers::lora::{ActivationFn, LoRA, LoRAConfig, LoRAType},
 };
 
+#[cfg(feature = "trace")]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {
+        let _rwkv_trace_scope = tracing::trace_span!($name).entered();
+    };
+}
+
+#[cfg(not(feature = "trace"))]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {};
+}
+
 #[derive(Config, Debug)]
 pub struct GatedReadoutConfig {
     num_cells: usize,
@@ -119,32 +131,52 @@ impl<B: Backend> GatedReadout<B> {
 
         let [batch_size_per_device, context_length, embedded_dim] = embedded_context.dims();
 
-        let embedded_context_gate = embedded_context + token_shifted_diff * self.param_gate.val();
+        let embedded_context_gate = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.gate_input");
+            embedded_context + token_shifted_diff * self.param_gate.val()
+        };
 
-        let gate = self.param_output_gate_lora.forward(embedded_context_gate);
+        let gate = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.gate");
+            self.param_output_gate_lora.forward(embedded_context_gate)
+        };
 
-        let wkv7_forward_output_normalized = self
-            .group_norm
-            .forward(
-                wkv7_forward_output.reshape([batch_size_per_device * context_length, embedded_dim]),
-            )
-            .reshape([batch_size_per_device, context_length, embedded_dim]);
+        let wkv7_forward_output_normalized = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.group_norm");
+            self.group_norm
+                .forward(
+                    wkv7_forward_output
+                        .reshape([batch_size_per_device * context_length, embedded_dim]),
+                )
+                .reshape([batch_size_per_device, context_length, embedded_dim])
+        };
 
-        let bonus: Tensor<B, 4> = (wkv7_forward_input_receptance
-            * wkv7_forward_input_replacement_key
-            * self
-                .param_receptance_key_bonus
-                .val()
-                .unsqueeze_dims(&[0, 1]))
-        .sum_dim(3)
-            * wkv7_forward_input_value;
+        let bonus: Tensor<B, 4> = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.bonus");
+            (wkv7_forward_input_receptance
+                * wkv7_forward_input_replacement_key
+                * self
+                    .param_receptance_key_bonus
+                    .val()
+                    .unsqueeze_dims(&[0, 1]))
+            .sum_dim(3)
+                * wkv7_forward_input_value
+        };
 
-        let bonus: Tensor<B, 3> =
-            bonus.reshape([batch_size_per_device, context_length, embedded_dim]);
+        let bonus: Tensor<B, 3> = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.bonus_reshape");
+            bonus.reshape([batch_size_per_device, context_length, embedded_dim])
+        };
 
-        let out_gated = (wkv7_forward_output_normalized + bonus) * gate;
+        let out_gated = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.apply_gate");
+            (wkv7_forward_output_normalized + bonus) * gate
+        };
 
-        self.projection_output.forward(out_gated)
+        {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.projection_output");
+            self.projection_output.forward(out_gated)
+        }
     }
 }
 

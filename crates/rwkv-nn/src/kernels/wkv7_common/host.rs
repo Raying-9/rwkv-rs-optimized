@@ -1,12 +1,11 @@
 use std::mem::size_of;
 
 use burn::{
-    backend::wgpu::{BoolElement, CubeBackend, FloatElement, IntElement},
     tensor::{DType, Shape, ops::FloatTensor},
 };
 use burn_cubecl::cubecl::{CubeCount, CubeDim, tensor_line_size_parallel};
 use burn_cubecl::{
-    CubeElement, CubeRuntime,
+    BoolElement, CubeBackend, CubeElement, CubeRuntime, FloatElement, IntElement,
     kernel::{cast, into_contiguous},
     ops::numeric::{empty_device, zeros_client},
 };

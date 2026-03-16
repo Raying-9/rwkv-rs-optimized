@@ -63,6 +63,7 @@ impl TokenizerLoop {
                     output_tx,
                     stop_suffixes,
                 } => {
+                    rwkv_bench::trace_lite_scope!("rwkv.infer.tokenizer_loop.register");
                     self.requests.insert(
                         entry_id,
                         TokenizerRequestState {
@@ -78,8 +79,11 @@ impl TokenizerLoop {
                     let Some(state) = self.requests.get_mut(&entry_id) else {
                         continue;
                     };
-                    let output = detokenize_output(&self.tokenizer, token);
-                    let delta = state.byte_decoder.push_output(output);
+                    let delta = {
+                        rwkv_bench::trace_lite_scope!("rwkv.infer.tokenizer_loop.output");
+                        let output = detokenize_output(&self.tokenizer, token);
+                        state.byte_decoder.push_output(output)
+                    };
                     if has_stream_delta_output(&delta)
                         && state
                             .output_tx
@@ -101,9 +105,12 @@ impl TokenizerLoop {
                     let Some(mut state) = self.requests.remove(&entry_id) else {
                         continue;
                     };
-                    let delta = state
-                        .byte_decoder
-                        .finish(finish_meta.matched_stop_suffix_index);
+                    let delta = {
+                        rwkv_bench::trace_lite_scope!("rwkv.infer.tokenizer_loop.finish");
+                        state
+                            .byte_decoder
+                            .finish(finish_meta.matched_stop_suffix_index)
+                    };
                     if has_stream_delta_output(&delta)
                         && state
                             .output_tx
@@ -134,12 +141,14 @@ fn has_stream_delta_output(delta: &super::StreamDelta) -> bool {
 }
 
 fn detokenize_output(tokenizer: &Tokenizer, token: OutputToken) -> InferenceOutput {
+    rwkv_bench::trace_lite_scope!("rwkv.infer.tokenizer_loop.detokenize");
     let bytes = tokenizer.token_bytes(token.token_id.max(0) as u16).to_vec();
     let token_text = String::from_utf8_lossy(&bytes).into_owned();
     let top_logprobs = token
         .top_logprobs
         .into_iter()
         .map(|candidate| {
+            rwkv_bench::trace_lite_scope!("rwkv.infer.tokenizer_loop.detokenize.top_logprobs");
             let bytes = tokenizer
                 .token_bytes(candidate.token_id.max(0) as u16)
                 .to_vec();

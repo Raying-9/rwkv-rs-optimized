@@ -6149,6 +6149,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rwkv-lm-eval"
+version = "0.1.0"
+dependencies = [
+ "rwkv-eval",
+]
+
+[[package]]
 name = "rwkv-nn"
 version = "0.1.0"
 dependencies = [
