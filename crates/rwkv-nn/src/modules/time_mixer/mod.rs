@@ -141,6 +141,10 @@ impl<B: Backend> TimeMixer<B> {
         self.gated_readout.init_weights(device);
     }
 
+    pub fn prepare_inference_cache(&mut self) {
+        self.weight_prepare.prepare_inference_cache();
+    }
+
     #[cfg_attr(
         feature = "trace",
         tracing::instrument(name = "rwkv.infer.model.time_mixer", skip_all)

@@ -488,7 +488,7 @@ where
                     model_cfg.head_size_auto,
                 );
                 let model_runtime = model_config.init::<B>(&device);
-                let model_runtime = model_runtime
+                let mut model_runtime = model_runtime
                     .load_file(
                         &generation_cfg.weights_path,
                         &NamedMpkFileRecorder::<FullPrecisionSettings>::new(),
@@ -500,6 +500,7 @@ where
                             generation_cfg.weights_path, generation_cfg.model_name
                         ))
                     })?;
+                model_runtime.prepare_inference_cache();
 
                 let executor = RwkvLmForward::<B>::new(
                     model_runtime,

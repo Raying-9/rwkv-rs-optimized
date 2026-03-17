@@ -1,10 +1,11 @@
 use burn::{
     config::Config,
-    module::{Module, Param},
+    module::{Ignored, Module, Param},
     nn::{Linear, LinearConfig},
     prelude::*,
     tensor::activation::{sigmoid, softplus},
 };
+use std::{any::Any, sync::Arc};
 
 use crate::kernels::wkv7_common::Wkv7ForwardInput;
 use crate::{
@@ -42,6 +43,40 @@ pub struct WeightPrepareConfig {
     weight_decay_lora_rank: usize,
     learning_rate_lora_rank: usize,
     value_residual_lora_rank: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PackedWeightPrepare<B: Backend> {
+    mix_params: Tensor<B, 4>,
+    projection_weights: Tensor<B, 4>,
+    lora_w_a: Tensor<B, 4>,
+    lora_w_b: Tensor<B, 4>,
+    lora_bias: Tensor<B, 4>,
+}
+
+#[derive(Clone)]
+struct PackedWeightPrepareAny(Arc<dyn Any + Send + Sync>);
+
+impl core::fmt::Debug for PackedWeightPrepareAny {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PackedWeightPrepareAny(..)")
+    }
+}
+
+impl PackedWeightPrepareAny {
+    fn new<B: Backend>(packed: PackedWeightPrepare<B>) -> Self
+    where
+        PackedWeightPrepare<B>: 'static + Send + Sync,
+    {
+        Self(Arc::new(packed))
+    }
+
+    fn downcast_ref<B: Backend>(&self) -> Option<&PackedWeightPrepare<B>>
+    where
+        PackedWeightPrepare<B>: 'static,
+    {
+        self.0.downcast_ref::<PackedWeightPrepare<B>>()
+    }
 }
 
 impl WeightPrepareConfig {
@@ -104,6 +139,7 @@ impl WeightPrepareConfig {
             embedded_dim: self.embedded_dim,
             num_heads: self.num_heads,
             head_size: self.head_size,
+            packed_infer: Ignored(None),
             cell_id,
         }
     }
@@ -132,6 +168,8 @@ pub struct WeightPrepare<B: Backend> {
     embedded_dim: usize,
     num_heads: usize,
     head_size: usize,
+
+    packed_infer: Ignored<Option<PackedWeightPrepareAny>>,
 
     #[module(skip)]
     cell_id: usize,
@@ -208,6 +246,30 @@ impl<B: Backend> WeightPrepare<B> {
 
         constant_init(&mut self.param_key_removal, 0.71);
         constant_init(&mut self.param_key_replacement, 1.02);
+        self.packed_infer = Ignored(None);
+    }
+
+    pub fn prepare_inference_cache(&mut self) {
+        let PackedGroupedLoRA {
+            w_a: lora_w_a,
+            w_b: lora_w_b,
+            bias: lora_bias,
+        } = pack_grouped_lora([
+            &self.param_weight_decay_lora,
+            &self.param_learning_rate_lora,
+        ]);
+
+        self.packed_infer = Ignored(Some(PackedWeightPrepareAny::new(PackedWeightPrepare {
+            mix_params: build_mix_params(self),
+            projection_weights: pack_grouped_linear_weights([
+                &self.projection_receptance,
+                &self.projection_key,
+                &self.projection_value,
+            ]),
+            lora_w_a,
+            lora_w_b,
+            lora_bias,
+        })));
     }
 
     #[cfg_attr(
@@ -268,16 +330,11 @@ impl<B: Backend> WeightPrepare<B> {
 
         let mix_params = {
             trace_lite_scope!("rwkv.infer.model.weight_prepare.scale_diff");
-            Tensor::stack::<4>(
-                vec![
-                    self.param_receptance.val(),
-                    self.param_key.val(),
-                    self.param_value.val(),
-                    self.param_weight_decay.val(),
-                    self.param_learning_rate.val(),
-                ],
-                0,
-            )
+            self.packed_infer
+                .as_ref()
+                .and_then(PackedWeightPrepareAny::downcast_ref::<B>)
+                .map(|packed| packed.mix_params.clone())
+                .unwrap_or_else(|| build_mix_params(self))
         };
 
         let mixed_inputs = {
@@ -296,14 +353,24 @@ impl<B: Backend> WeightPrepare<B> {
                 context_length,
                 embedded_dim,
             );
-            grouped_linear_forward(
-                projection_inputs,
-                [
-                    &self.projection_receptance,
-                    &self.projection_key,
-                    &self.projection_value,
-                ],
-            )
+            match self
+                .packed_infer
+                .as_ref()
+                .and_then(PackedWeightPrepareAny::downcast_ref::<B>)
+            {
+                Some(packed) => grouped_linear_forward_packed(
+                    projection_inputs,
+                    packed.projection_weights.clone(),
+                ),
+                None => grouped_linear_forward(
+                    projection_inputs,
+                    [
+                        &self.projection_receptance,
+                        &self.projection_key,
+                        &self.projection_value,
+                    ],
+                ),
+            }
         };
 
         let (receptance, key_precursor, value_precursor) = {
@@ -343,14 +410,27 @@ impl<B: Backend> WeightPrepare<B> {
                 context_length,
                 embedded_dim,
             );
-            grouped_lora_forward(
-                lora_inputs,
-                [
-                    &self.param_weight_decay_lora,
-                    &self.param_learning_rate_lora,
-                ],
-                [ActivationFn::Tanh, ActivationFn::NoOP],
-            )
+            match self
+                .packed_infer
+                .as_ref()
+                .and_then(PackedWeightPrepareAny::downcast_ref::<B>)
+            {
+                Some(packed) => grouped_lora_forward_packed(
+                    lora_inputs,
+                    packed.lora_w_a.clone(),
+                    packed.lora_w_b.clone(),
+                    packed.lora_bias.clone(),
+                    [ActivationFn::Tanh, ActivationFn::NoOP],
+                ),
+                None => grouped_lora_forward(
+                    lora_inputs,
+                    [
+                        &self.param_weight_decay_lora,
+                        &self.param_learning_rate_lora,
+                    ],
+                    [ActivationFn::Tanh, ActivationFn::NoOP],
+                ),
+            }
         };
 
         let (weight_decay_lora_result, learning_rate_pre_sigmoid) = {
@@ -363,13 +443,7 @@ impl<B: Backend> WeightPrepare<B> {
                     context_length,
                     embedded_dim,
                 ),
-                extract_fanout_input(
-                    lora_outputs,
-                    1,
-                    batch_size,
-                    context_length,
-                    embedded_dim,
-                ),
+                extract_fanout_input(lora_outputs, 1, batch_size, context_length, embedded_dim),
             )
         };
 
@@ -505,20 +579,73 @@ fn extract_fanout_group<B: Backend>(
     ])
 }
 
-fn grouped_linear_forward<B: Backend, const N: usize>(
-    input: Tensor<B, 4>,
+fn build_mix_params<B: Backend>(weight_prepare: &WeightPrepare<B>) -> Tensor<B, 4> {
+    Tensor::stack::<4>(
+        vec![
+            weight_prepare.param_receptance.val(),
+            weight_prepare.param_key.val(),
+            weight_prepare.param_value.val(),
+            weight_prepare.param_weight_decay.val(),
+            weight_prepare.param_learning_rate.val(),
+        ],
+        0,
+    )
+}
+
+fn pack_grouped_linear_weights<B: Backend, const N: usize>(
     linears: [&Linear<B>; N],
 ) -> Tensor<B, 4> {
-    let weights = Tensor::stack::<3>(
+    Tensor::stack::<3>(
         linears
             .iter()
             .map(|linear| linear.weight.val())
             .collect::<Vec<_>>(),
         0,
     )
-    .unsqueeze_dim::<4>(1);
+    .unsqueeze_dim::<4>(1)
+}
 
+fn grouped_linear_forward<B: Backend, const N: usize>(
+    input: Tensor<B, 4>,
+    linears: [&Linear<B>; N],
+) -> Tensor<B, 4> {
+    grouped_linear_forward_packed(input, pack_grouped_linear_weights(linears))
+}
+
+fn grouped_linear_forward_packed<B: Backend>(
+    input: Tensor<B, 4>,
+    weights: Tensor<B, 4>,
+) -> Tensor<B, 4> {
     input.matmul(weights)
+}
+
+#[derive(Debug)]
+struct PackedGroupedLoRA<B: Backend> {
+    w_a: Tensor<B, 4>,
+    w_b: Tensor<B, 4>,
+    bias: Tensor<B, 4>,
+}
+
+fn pack_grouped_lora<B: Backend, const N: usize>(loras: [&LoRA<B>; N]) -> PackedGroupedLoRA<B> {
+    PackedGroupedLoRA {
+        w_a: Tensor::stack::<3>(
+            loras.iter().map(|lora| lora.w_a.val()).collect::<Vec<_>>(),
+            0,
+        )
+        .unsqueeze_dim::<4>(1),
+        w_b: Tensor::stack::<3>(
+            loras.iter().map(|lora| lora.w_b.val()).collect::<Vec<_>>(),
+            0,
+        )
+        .unsqueeze_dim::<4>(1),
+        bias: Tensor::stack::<4>(
+            loras
+                .iter()
+                .map(|lora| lora.bias.as_ref().expect("expected LoRA bias").val())
+                .collect::<Vec<_>>(),
+            0,
+        ),
+    }
 }
 
 fn grouped_lora_forward<B: Backend, const N: usize>(
@@ -526,30 +653,17 @@ fn grouped_lora_forward<B: Backend, const N: usize>(
     loras: [&LoRA<B>; N],
     activation_fns: [ActivationFn; N],
 ) -> Tensor<B, 4> {
-    let w_a = Tensor::stack::<3>(
-        loras
-            .iter()
-            .map(|lora| lora.w_a.val())
-            .collect::<Vec<_>>(),
-        0,
-    )
-    .unsqueeze_dim::<4>(1);
-    let w_b = Tensor::stack::<3>(
-        loras
-            .iter()
-            .map(|lora| lora.w_b.val())
-            .collect::<Vec<_>>(),
-        0,
-    )
-    .unsqueeze_dim::<4>(1);
-    let bias: Tensor<B, 4> = Tensor::stack::<4>(
-        loras
-            .iter()
-            .map(|lora| lora.bias.as_ref().expect("expected LoRA bias").val())
-            .collect::<Vec<_>>(),
-        0,
-    );
+    let PackedGroupedLoRA { w_a, w_b, bias } = pack_grouped_lora(loras);
+    grouped_lora_forward_packed(input, w_a, w_b, bias, activation_fns)
+}
 
+fn grouped_lora_forward_packed<B: Backend, const N: usize>(
+    input: Tensor<B, 4>,
+    w_a: Tensor<B, 4>,
+    w_b: Tensor<B, 4>,
+    bias: Tensor<B, 4>,
+    activation_fns: [ActivationFn; N],
+) -> Tensor<B, 4> {
     let hidden = input.matmul(w_a);
     let [group_size, batch_size, context_length, hidden_dim] = hidden.dims();
 

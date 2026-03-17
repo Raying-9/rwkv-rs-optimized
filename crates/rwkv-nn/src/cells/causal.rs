@@ -61,6 +61,12 @@ impl<B: Backend> MultiCausalCells<B> {
             .for_each(|cell| cell.init_weights(device));
     }
 
+    pub fn prepare_inference_cache(&mut self) {
+        self.cells
+            .iter_mut()
+            .for_each(CausalCell::prepare_inference_cache);
+    }
+
     #[cfg_attr(
         feature = "trace",
         tracing::instrument(name = "rwkv.infer.model.cells", skip_all)
@@ -192,6 +198,10 @@ impl<B: Backend> CausalCell<B> {
     pub fn init_weights(&mut self, device: &B::Device) {
         self.time_mixer.init_weights(device);
         self.channel_mixer.init_weights(device);
+    }
+
+    pub fn prepare_inference_cache(&mut self) {
+        self.time_mixer.prepare_inference_cache();
     }
 
     #[cfg_attr(feature = "trace", tracing::instrument(name = "rwkv.infer.model.cell", skip_all, fields(cell_id = self.cell_id)))]

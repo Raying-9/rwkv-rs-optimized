@@ -111,6 +111,10 @@ impl<B: Backend> AutoRegressiveModel<B> {
         self.cells.init_weights(device);
     }
 
+    pub fn prepare_inference_cache(&mut self) {
+        self.cells.prepare_inference_cache();
+    }
+
     #[cfg(feature = "training")]
     pub fn forward<K: Wkv7Kernel<B>>(
         &self,
