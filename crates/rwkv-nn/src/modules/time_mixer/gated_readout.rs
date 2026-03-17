@@ -236,12 +236,14 @@ impl<B: Backend> GatedReadout<B> {
 
         let wkv7_forward_output_normalized = {
             trace_lite_scope!("rwkv.infer.model.gated_readout.group_norm");
-            self.group_norm
-                .forward(
-                    wkv7_forward_output
-                        .reshape([batch_size_per_device * context_length, embedded_dim]),
-                )
-                .reshape([batch_size_per_device, context_length, embedded_dim])
+            group_norm_heads(
+                wkv7_forward_output.reshape([batch_size_per_device, context_length, embedded_dim]),
+                self.num_heads,
+                self.head_size,
+                self.group_norm.gamma.as_ref().map(|gamma| gamma.val()),
+                self.group_norm.beta.as_ref().map(|beta| beta.val()),
+                self.group_norm.epsilon,
+            )
         };
 
         let bonus: Tensor<B, 4> = {
@@ -332,8 +334,14 @@ impl<B: Backend> GatedReadout<B> {
 
         let wkv7_forward_output_normalized = {
             trace_lite_scope!("rwkv.infer.model.gated_readout.group_norm_decode");
-            self.group_norm
-                .forward(wkv7_forward_output.reshape([batch_size_per_device, embedded_dim]))
+            group_norm_heads_decode(
+                wkv7_forward_output.reshape([batch_size_per_device, embedded_dim]),
+                self.num_heads,
+                self.head_size,
+                self.group_norm.gamma.as_ref().map(|gamma| gamma.val()),
+                self.group_norm.beta.as_ref().map(|beta| beta.val()),
+                self.group_norm.epsilon,
+            )
         };
 
         let bonus: Tensor<B, 2> = {
@@ -405,6 +413,64 @@ fn linear_forward_packed<B: Backend>(x: Tensor<B, 3>, weight: Tensor<B, 3>) -> T
 
 fn linear_forward_packed_decode<B: Backend>(x: Tensor<B, 2>, weight: Tensor<B, 2>) -> Tensor<B, 2> {
     x.matmul(weight)
+}
+
+fn group_norm_heads<B: Backend>(
+    input: Tensor<B, 3>,
+    num_heads: usize,
+    head_size: usize,
+    gamma: Option<Tensor<B, 1>>,
+    beta: Option<Tensor<B, 1>>,
+    epsilon: f64,
+) -> Tensor<B, 3> {
+    let [batch_size, context_length, embedded_dim] = input.dims();
+    debug_assert_eq!(embedded_dim, num_heads * head_size);
+
+    let input = input.reshape([batch_size, context_length, num_heads, head_size]);
+    let mean = input.clone().sum_dim(3) / head_size as f64;
+    let input = input.sub(mean);
+    let var = input.clone().square().sum_dim(3) / head_size as f64;
+    let input = input.div(var.add_scalar(epsilon).sqrt());
+
+    let input = match (gamma, beta) {
+        (Some(gamma), Some(beta)) => {
+            let gamma = gamma.reshape([1, 1, num_heads, head_size]);
+            let beta = beta.reshape([1, 1, num_heads, head_size]);
+            input.mul(gamma).add(beta)
+        }
+        _ => input,
+    };
+
+    input.reshape([batch_size, context_length, embedded_dim])
+}
+
+fn group_norm_heads_decode<B: Backend>(
+    input: Tensor<B, 2>,
+    num_heads: usize,
+    head_size: usize,
+    gamma: Option<Tensor<B, 1>>,
+    beta: Option<Tensor<B, 1>>,
+    epsilon: f64,
+) -> Tensor<B, 2> {
+    let [batch_size, embedded_dim] = input.dims();
+    debug_assert_eq!(embedded_dim, num_heads * head_size);
+
+    let input = input.reshape([batch_size, num_heads, head_size]);
+    let mean = input.clone().sum_dim(2) / head_size as f64;
+    let input = input.sub(mean);
+    let var = input.clone().square().sum_dim(2) / head_size as f64;
+    let input = input.div(var.add_scalar(epsilon).sqrt());
+
+    let input = match (gamma, beta) {
+        (Some(gamma), Some(beta)) => {
+            let gamma = gamma.reshape([1, num_heads, head_size]);
+            let beta = beta.reshape([1, num_heads, head_size]);
+            input.mul(gamma).add(beta)
+        }
+        _ => input,
+    };
+
+    input.reshape([batch_size, embedded_dim])
 }
 
 pub struct GatedReadoutInput<B: Backend> {

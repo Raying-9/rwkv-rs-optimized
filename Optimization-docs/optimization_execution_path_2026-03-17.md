@@ -159,6 +159,8 @@ Implemented so far:
 
 - `weight_prepare` now uses a dedicated L2 normalization helper for `removal_key`
   instead of the generic `abs -> pow -> sum -> pow` path
+- `gated_readout` now uses a specialized head-wise group norm path instead of flattening into
+  Burn's generic `GroupNorm::forward()` flow
 
 ## Phase 5: executor-side state movement
 
