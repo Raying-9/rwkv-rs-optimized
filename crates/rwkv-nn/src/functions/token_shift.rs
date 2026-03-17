@@ -197,6 +197,47 @@ pub fn token_shift_diff<B: Backend>(
     shifted_diff
 }
 
+/// Decode-specialized token-shift diff for `context_length == 1`.
+///
+/// This avoids the generic token-shift plumbing used for prefill and computes:
+/// `external_shift - current_embedding`, optionally masked, then restores the
+/// `[batch_size, 1, embedded_dim]` shape expected by TMix/CMix.
+pub fn token_shift_diff_decode<B: Backend>(
+    embedded_context: Tensor<B, 3>,
+    embedded_token_shift: Option<Tensor<B, 2>>,
+    context_mask: Option<Tensor<B, 2>>,
+) -> Tensor<B, 3> {
+    let [batch_size, context_length, embedded_dim] = embedded_context.dims();
+    debug_assert_eq!(
+        context_length, 1,
+        "token_shift_diff_decode expects context_length == 1"
+    );
+
+    let embedded_token_shift = embedded_token_shift.unwrap_or(Tensor::zeros(
+        [batch_size, embedded_dim],
+        &embedded_context.device(),
+    ));
+
+    let current_embedding = {
+        trace_lite_scope!("rwkv.infer.model.token_shift_diff.decode_current");
+        embedded_context.squeeze_dim(1)
+    };
+
+    let decode_diff = {
+        trace_lite_scope!("rwkv.infer.model.token_shift_diff.decode_diff_2d");
+        embedded_token_shift - current_embedding
+    }
+    .unsqueeze_dim(1);
+
+    match context_mask {
+        Some(mask) => {
+            trace_lite_scope!("rwkv.infer.model.token_shift_diff.decode_mask");
+            decode_diff * mask.unsqueeze_dim(2)
+        }
+        None => decode_diff,
+    }
+}
+
 pub fn get_embedded_token_shift<B: Backend>(embedded_context: Tensor<B, 3>) -> Tensor<B, 2> {
     let [batch_size, context_length, embedded_dim] = embedded_context.dims();
     if context_length == 0 {

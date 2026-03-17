@@ -16,7 +16,7 @@ use crate::{
         },
         lerp::lerp,
         normalize::normalize,
-        token_shift::token_shift_diff,
+        token_shift::{token_shift_diff, token_shift_diff_decode},
     },
     layers::lora::{ActivationFn, LoRA, LoRAConfig, LoRAType},
 };
@@ -285,18 +285,32 @@ impl<B: Backend> WeightPrepare<B> {
     ) -> WeightPrepareOutput<B> {
         let [_, _context_length, _] = embedded_context.dims();
         let token_shifted_diff = {
-            #[cfg(feature = "trace")]
-            let _token_shift_scope = tracing::trace_span!(
-                "rwkv.infer.model.weight_prepare.token_shift_diff",
-                cell_id = self.cell_id,
-                context_length = _context_length
-            )
-            .entered();
-            token_shift_diff(
-                embedded_context.clone(),
-                embedded_token_shift,
-                context_mask.clone(),
-            )
+            if _context_length == 1 {
+                #[cfg(feature = "trace")]
+                let _token_shift_scope = tracing::trace_span!(
+                    "rwkv.infer.model.weight_prepare.token_shift_diff_decode_fastpath",
+                    cell_id = self.cell_id
+                )
+                .entered();
+                token_shift_diff_decode(
+                    embedded_context.clone(),
+                    embedded_token_shift,
+                    context_mask.clone(),
+                )
+            } else {
+                #[cfg(feature = "trace")]
+                let _token_shift_scope = tracing::trace_span!(
+                    "rwkv.infer.model.weight_prepare.token_shift_diff",
+                    cell_id = self.cell_id,
+                    context_length = _context_length
+                )
+                .entered();
+                token_shift_diff(
+                    embedded_context.clone(),
+                    embedded_token_shift,
+                    context_mask.clone(),
+                )
+            }
         };
 
         self.forward_with_token_shifted_diff(

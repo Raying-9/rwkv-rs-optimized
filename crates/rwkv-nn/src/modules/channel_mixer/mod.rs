@@ -9,7 +9,7 @@ use burn::{
 use crate::functions::{
     context_mask::apply_context_mask,
     init_weights::{get_token_shift_diff_scale, uniform_init, zeros_init},
-    token_shift::{get_embedded_token_shift, token_shift_diff},
+    token_shift::{get_embedded_token_shift, token_shift_diff, token_shift_diff_decode},
 };
 
 #[cfg(feature = "trace")]
@@ -108,18 +108,32 @@ impl<B: Backend> ChannelMixer<B> {
 
         let [_, _context_length, _] = embedded_context.dims();
         let token_shifted_diff = {
-            #[cfg(feature = "trace")]
-            let _token_shift_scope = tracing::trace_span!(
-                "rwkv.infer.model.channel_mixer.token_shift_diff",
-                cell_id = self.cell_id,
-                context_length = _context_length
-            )
-            .entered();
-            token_shift_diff(
-                embedded_context.clone(),
-                embedded_token_shift,
-                context_mask.clone(),
-            )
+            if _context_length == 1 {
+                #[cfg(feature = "trace")]
+                let _token_shift_scope = tracing::trace_span!(
+                    "rwkv.infer.model.channel_mixer.token_shift_diff_decode_fastpath",
+                    cell_id = self.cell_id
+                )
+                .entered();
+                token_shift_diff_decode(
+                    embedded_context.clone(),
+                    embedded_token_shift,
+                    context_mask.clone(),
+                )
+            } else {
+                #[cfg(feature = "trace")]
+                let _token_shift_scope = tracing::trace_span!(
+                    "rwkv.infer.model.channel_mixer.token_shift_diff",
+                    cell_id = self.cell_id,
+                    context_length = _context_length
+                )
+                .entered();
+                token_shift_diff(
+                    embedded_context.clone(),
+                    embedded_token_shift,
+                    context_mask.clone(),
+                )
+            }
         };
 
         let embedded_context_shift = {

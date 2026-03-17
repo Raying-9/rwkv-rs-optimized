@@ -78,7 +78,7 @@ Validation:
 
 ## Phase 2: decode-specialized fast path
 
-Status: pending
+Status: in progress
 
 Goal:
 
@@ -96,6 +96,17 @@ Reason:
   - `token_shift_diff.decode_fastpath`
   - `token_shift_diff.final_cat`
   - `token_shift_diff.tail_blend`
+
+Implemented so far:
+
+- added a decode-specialized `token_shift_diff_decode()` helper
+- `weight_prepare` now routes `context_length == 1` through the decode helper
+- `channel_mixer` now routes `context_length == 1` through the decode helper
+
+Remaining:
+
+- push the decode branch further down so mixed inputs themselves can be built directly without
+  the generic fanout-shaped tensor path
 
 ## Phase 3: extend fanout fusion to remaining branches
 
