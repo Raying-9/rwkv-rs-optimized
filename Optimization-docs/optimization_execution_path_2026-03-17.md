@@ -129,7 +129,7 @@ Reason:
 
 ## Phase 4: specialized normalization and gated readout cleanup
 
-Status: pending
+Status: in progress
 
 Goal:
 
@@ -140,6 +140,11 @@ Goal:
 Reason:
 
 - `normalize_removal_key` and `group_norm` are still material hotspots
+
+Implemented so far:
+
+- `weight_prepare` now uses a dedicated L2 normalization helper for `removal_key`
+  instead of the generic `abs -> pow -> sum -> pow` path
 
 ## Phase 5: executor-side state movement
 

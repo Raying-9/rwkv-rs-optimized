@@ -15,7 +15,7 @@ use crate::{
             uniform_init,
         },
         lerp::lerp,
-        normalize::normalize,
+        normalize::normalize_l2,
         token_shift::{token_shift_diff, token_shift_diff_decode},
     },
     layers::lora::{ActivationFn, LoRA, LoRAConfig, LoRAType},
@@ -506,7 +506,7 @@ impl<B: Backend> WeightPrepare<B> {
 
         let removal_key_normalized = {
             trace_lite_scope!("rwkv.infer.model.weight_prepare.normalize_removal_key");
-            -normalize(removal_key_reshaped, 2.0, -1, 1e-12).reshape([batch_size, embedded_dim])
+            -normalize_l2(removal_key_reshaped, -1, 1e-12).reshape([batch_size, embedded_dim])
         };
 
         let replacement = {
@@ -729,7 +729,7 @@ impl<B: Backend> WeightPrepare<B> {
 
         let removal_key_normalized = {
             trace_lite_scope!("rwkv.infer.model.weight_prepare.normalize_removal_key");
-            -normalize(removal_key_reshaped, 2.0, -1, 1e-12).reshape([
+            -normalize_l2(removal_key_reshaped, -1, 1e-12).reshape([
                 batch_size,
                 context_length,
                 embedded_dim,
