@@ -104,12 +104,15 @@ Implemented so far:
 - `channel_mixer` now routes `context_length == 1` through the decode helper
 - `weight_prepare` now has a decode-specialized inner execution path using 2D grouped inputs
 - `channel_mixer` now has a decode-specialized 2D execution path
+- `gated_readout` now routes `context_length == 1` through a decode-specialized 2D path
+- the decode path now avoids generic 3D gate input, gate LoRA, reshape-heavy bonus assembly, and
+  output projection flow
 
 Remaining:
 
 - push the decode branch further down so mixed inputs themselves can be built directly without
   the generic fanout-shaped tensor path
-- evaluate whether `gated_readout` also needs a decode-specialized path
+- evaluate whether `TimeMixer` can bypass some outer reshape/mask work for decode as well
 
 ## Phase 3: extend fanout fusion to remaining branches
 

@@ -130,6 +130,16 @@ impl<B: Backend> GatedReadout<B> {
         } = gated_readout_input;
 
         let [batch_size_per_device, context_length, embedded_dim] = embedded_context.dims();
+        if context_length == 1 {
+            return self.forward_decode(
+                embedded_context,
+                token_shifted_diff,
+                wkv7_forward_output,
+                wkv7_forward_input_receptance,
+                wkv7_forward_input_replacement_key,
+                wkv7_forward_input_value,
+            );
+        }
 
         let embedded_context_gate = {
             trace_lite_scope!("rwkv.infer.model.gated_readout.gate_input");
@@ -176,6 +186,70 @@ impl<B: Backend> GatedReadout<B> {
         {
             trace_lite_scope!("rwkv.infer.model.gated_readout.projection_output");
             self.projection_output.forward(out_gated)
+        }
+    }
+
+    fn forward_decode(
+        &self,
+        embedded_context: Tensor<B, 3>,
+        token_shifted_diff: Tensor<B, 3>,
+        wkv7_forward_output: Tensor<B, 4>,
+        wkv7_forward_input_receptance: Tensor<B, 4>,
+        wkv7_forward_input_replacement_key: Tensor<B, 4>,
+        wkv7_forward_input_value: Tensor<B, 4>,
+    ) -> Tensor<B, 3> {
+        let [batch_size_per_device, context_length, embedded_dim] = embedded_context.dims();
+        debug_assert_eq!(context_length, 1);
+
+        let embedded_context: Tensor<B, 2> = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.decode_embedded_context");
+            embedded_context.squeeze_dim(1)
+        };
+        let token_shifted_diff: Tensor<B, 2> = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.decode_token_shifted_diff");
+            token_shifted_diff.squeeze_dim(1)
+        };
+
+        let embedded_context_gate = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.gate_input_decode");
+            let param_gate: Tensor<B, 1> = self
+                .param_gate
+                .val()
+                .squeeze_dim::<2>(0)
+                .squeeze_dim::<1>(0);
+            embedded_context + token_shifted_diff * param_gate.unsqueeze_dim(0)
+        };
+
+        let gate = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.gate_decode");
+            self.param_output_gate_lora
+                .forward_2d(embedded_context_gate)
+        };
+
+        let wkv7_forward_output_normalized = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.group_norm_decode");
+            self.group_norm
+                .forward(wkv7_forward_output.reshape([batch_size_per_device, embedded_dim]))
+        };
+
+        let bonus: Tensor<B, 2> = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.bonus_decode");
+            let bonus: Tensor<B, 3> = (wkv7_forward_input_receptance.squeeze_dim(1)
+                * wkv7_forward_input_replacement_key.squeeze_dim(1)
+                * self.param_receptance_key_bonus.val().unsqueeze_dim(0))
+            .sum_dim(2)
+                * wkv7_forward_input_value.squeeze_dim(1);
+            bonus.reshape([batch_size_per_device, embedded_dim])
+        };
+
+        let out_gated = {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.apply_gate_decode");
+            (wkv7_forward_output_normalized + bonus) * gate
+        };
+
+        {
+            trace_lite_scope!("rwkv.infer.model.gated_readout.projection_output_decode");
+            self.projection_output.forward(out_gated).unsqueeze_dim(1)
         }
     }
 }
