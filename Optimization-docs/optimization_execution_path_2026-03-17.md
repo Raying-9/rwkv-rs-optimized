@@ -107,6 +107,8 @@ Implemented so far:
 - `gated_readout` now routes `context_length == 1` through a decode-specialized 2D path
 - the decode path now avoids generic 3D gate input, gate LoRA, reshape-heavy bonus assembly, and
   output projection flow
+- `TimeMixer` now avoids cloning the full `Wkv7ForwardInput` bundle and uses a direct decode
+  `embedded_token_shift` squeeze path when `context_length == 1`
 
 Remaining:
 

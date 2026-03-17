@@ -4,13 +4,16 @@ mod weight_prepare;
 
 use burn::{config::Config, module::Module, prelude::*};
 
-use crate::{kernels::wkv7_common::Wkv7Kernel, layers::lora::LoRARanks};
+use crate::{
+    kernels::wkv7_common::{Wkv7ForwardInput, Wkv7Kernel},
+    layers::lora::LoRARanks,
+};
 
 use crate::functions::context_mask::apply_context_mask;
 use crate::functions::token_shift::get_embedded_token_shift;
 use crate::modules::time_mixer::gated_readout::GatedReadoutInput;
 use gated_readout::{GatedReadout, GatedReadoutConfig};
-use weight_prepare::{WeightPrepare, WeightPrepareConfig};
+use weight_prepare::{WeightPrepare, WeightPrepareConfig, WeightPrepareOutput};
 
 const MIN_LORA_RANK: usize = 32;
 const LORA_RANK_GRANULARITY: usize = 32;
@@ -165,11 +168,24 @@ impl<B: Backend> TimeMixer<B> {
         let embedded_context = apply_context_mask(embedded_context, context_mask.clone());
         let value_from_first_cell = apply_context_mask(value_from_first_cell, context_mask.clone());
 
-        let output_embedded_token_shift = embedded_token_shift
-            .as_ref()
-            .map(|_| get_embedded_token_shift(embedded_context.clone()));
+        let output_embedded_token_shift = embedded_token_shift.as_ref().map(|_| {
+            if context_length == 1 {
+                embedded_context.clone().squeeze_dim(1)
+            } else {
+                get_embedded_token_shift(embedded_context.clone())
+            }
+        });
 
-        let weight_prepare_output = self.weight_prepare.forward(
+        let WeightPrepareOutput {
+            token_shifted_diff,
+            value_from_first_cell,
+            receptance,
+            weight_decay,
+            replacement_key,
+            value,
+            removal_key_normalized,
+            replacement,
+        } = self.weight_prepare.forward(
             embedded_context.clone(),
             value_from_first_cell.clone(),
             embedded_token_shift,
@@ -177,16 +193,29 @@ impl<B: Backend> TimeMixer<B> {
         );
 
         let shape = [batch_size_per_device, context_length, num_heads, head_size];
-        let wkv7_forward_input = weight_prepare_output.reshape_to_wkv7_input(shape);
-        let wkv7_forward_output =
-            K::forward(wkv7_forward_input.clone(), state, 16, context_mask.clone());
+        let wkv7_forward_input_receptance = receptance.clone().reshape(shape);
+        let wkv7_forward_input_replacement_key = replacement_key.clone().reshape(shape);
+        let wkv7_forward_input_value = value.clone().reshape(shape);
+        let wkv7_forward_output = K::forward(
+            Wkv7ForwardInput {
+                receptance: receptance.reshape(shape),
+                weight_decay: weight_decay.reshape(shape),
+                replacement_key: replacement_key.reshape(shape),
+                value: value.reshape(shape),
+                removal_key_normalized: removal_key_normalized.reshape(shape),
+                replacement: replacement.reshape(shape),
+            },
+            state,
+            16,
+            context_mask.clone(),
+        );
         let gated_readout_input = GatedReadoutInput {
             embedded_context,
-            token_shifted_diff: weight_prepare_output.token_shifted_diff,
+            token_shifted_diff,
             wkv7_forward_output: wkv7_forward_output.output,
-            wkv7_forward_input_receptance: wkv7_forward_input.receptance,
-            wkv7_forward_input_replacement_key: wkv7_forward_input.replacement_key,
-            wkv7_forward_input_value: wkv7_forward_input.value,
+            wkv7_forward_input_receptance,
+            wkv7_forward_input_replacement_key,
+            wkv7_forward_input_value,
         };
 
         let output_embedded_context = self.gated_readout.forward(gated_readout_input);
@@ -194,10 +223,7 @@ impl<B: Backend> TimeMixer<B> {
         TimeMixerIO {
             embedded_context: apply_context_mask(output_embedded_context, context_mask.clone()),
             context_mask: context_mask.clone(),
-            value_from_first_cell: apply_context_mask(
-                weight_prepare_output.value_from_first_cell,
-                context_mask,
-            ),
+            value_from_first_cell: apply_context_mask(value_from_first_cell, context_mask),
             embedded_token_shift: output_embedded_token_shift,
             state: wkv7_forward_output.next_state,
         }
