@@ -118,7 +118,7 @@ Remaining:
 
 ## Phase 3: extend fanout fusion to remaining branches
 
-Status: pending
+Status: in progress
 
 Goal:
 
@@ -128,6 +128,12 @@ Reason:
 
 - both still depend on the same `embedded_context + token_shifted_diff * coeff` structure
 - this matches the shape of `fused_addcmul.py`
+
+Implemented so far:
+
+- `weight_prepare` now folds `value_residual_lora` into the grouped LoRA path when present
+- because LoRA ranks differ across branches, grouped packing now pads to the max rank with zeros
+  during inference cache prep and fallback packing
 
 ## Phase 4: specialized normalization and gated readout cleanup
 

@@ -51,6 +51,7 @@ struct PackedWeightPrepare<B: Backend> {
     mix_params_decode: Tensor<B, 3>,
     projection_weights: Tensor<B, 4>,
     projection_weights_decode: Tensor<B, 3>,
+    has_value_residual_lora: bool,
     lora_w_a: Tensor<B, 4>,
     lora_w_a_decode: Tensor<B, 3>,
     lora_w_b: Tensor<B, 4>,
@@ -259,10 +260,18 @@ impl<B: Backend> WeightPrepare<B> {
             w_a: lora_w_a,
             w_b: lora_w_b,
             bias: lora_bias,
-        } = pack_grouped_lora([
-            &self.param_weight_decay_lora,
-            &self.param_learning_rate_lora,
-        ]);
+        } = if let Some(value_residual_lora) = self.param_value_residual_lora.as_ref() {
+            pack_grouped_lora([
+                &self.param_weight_decay_lora,
+                &self.param_learning_rate_lora,
+                value_residual_lora,
+            ])
+        } else {
+            pack_grouped_lora([
+                &self.param_weight_decay_lora,
+                &self.param_learning_rate_lora,
+            ])
+        };
 
         let mix_params = build_mix_params(self);
         let projection_weights = pack_grouped_linear_weights([
@@ -276,6 +285,7 @@ impl<B: Backend> WeightPrepare<B> {
             mix_params_decode: mix_params.squeeze_dim(1),
             projection_weights: projection_weights.clone(),
             projection_weights_decode: projection_weights.squeeze_dim(1),
+            has_value_residual_lora: self.param_value_residual_lora.is_some(),
             lora_w_a: lora_w_a.clone(),
             lora_w_a_decode: lora_w_a.squeeze_dim(1),
             lora_w_b: lora_w_b.clone(),
@@ -405,39 +415,80 @@ impl<B: Backend> WeightPrepare<B> {
         let value_precursor =
             extract_fanout_input_decode(projection_outputs, 2, batch_size, embedded_dim);
 
-        let lora_outputs = {
+        let (weight_decay_lora_result, learning_rate_pre_sigmoid, value_residual_pre_sigmoid) = {
             trace_lite_scope!("rwkv.infer.model.weight_prepare.grouped_lora_decode");
-            let lora_inputs =
-                extract_fanout_group_decode(mixed_inputs.clone(), 3, 2, batch_size, embedded_dim);
-            match packed {
-                Some(packed) => grouped_lora_forward_decode(
-                    lora_inputs,
-                    packed.lora_w_a_decode.clone(),
-                    packed.lora_w_b_decode.clone(),
-                    packed.lora_bias_decode.clone(),
-                    [ActivationFn::Tanh, ActivationFn::NoOP],
-                ),
-                None => {
-                    let PackedGroupedLoRADecode { w_a, w_b, bias } = pack_grouped_lora_decode([
-                        &self.param_weight_decay_lora,
-                        &self.param_learning_rate_lora,
-                    ]);
-                    grouped_lora_forward_decode(
+            if let Some(value_residual_lora) = self.param_value_residual_lora.as_ref() {
+                let lora_inputs =
+                    extract_fanout_inputs_decode(mixed_inputs, [3, 4, 2], batch_size, embedded_dim);
+                let lora_outputs = match packed {
+                    Some(packed) if packed.has_value_residual_lora => grouped_lora_forward_decode(
                         lora_inputs,
-                        w_a,
-                        w_b,
-                        bias,
+                        packed.lora_w_a_decode.clone(),
+                        packed.lora_w_b_decode.clone(),
+                        packed.lora_bias_decode.clone(),
+                        [ActivationFn::Tanh, ActivationFn::NoOP, ActivationFn::NoOP],
+                    ),
+                    _ => {
+                        let PackedGroupedLoRADecode { w_a, w_b, bias } =
+                            pack_grouped_lora_decode([
+                                &self.param_weight_decay_lora,
+                                &self.param_learning_rate_lora,
+                                value_residual_lora,
+                            ]);
+                        grouped_lora_forward_decode(
+                            lora_inputs,
+                            w_a,
+                            w_b,
+                            bias,
+                            [ActivationFn::Tanh, ActivationFn::NoOP, ActivationFn::NoOP],
+                        )
+                    }
+                };
+
+                (
+                    extract_fanout_input_decode(lora_outputs.clone(), 0, batch_size, embedded_dim),
+                    extract_fanout_input_decode(lora_outputs.clone(), 1, batch_size, embedded_dim),
+                    Some(extract_fanout_input_decode(
+                        lora_outputs,
+                        2,
+                        batch_size,
+                        embedded_dim,
+                    )),
+                )
+            } else {
+                let lora_inputs =
+                    extract_fanout_group_decode(mixed_inputs, 3, 2, batch_size, embedded_dim);
+                let lora_outputs = match packed {
+                    Some(packed) => grouped_lora_forward_decode(
+                        lora_inputs,
+                        packed.lora_w_a_decode.clone(),
+                        packed.lora_w_b_decode.clone(),
+                        packed.lora_bias_decode.clone(),
                         [ActivationFn::Tanh, ActivationFn::NoOP],
-                    )
-                }
+                    ),
+                    None => {
+                        let PackedGroupedLoRADecode { w_a, w_b, bias } =
+                            pack_grouped_lora_decode([
+                                &self.param_weight_decay_lora,
+                                &self.param_learning_rate_lora,
+                            ]);
+                        grouped_lora_forward_decode(
+                            lora_inputs,
+                            w_a,
+                            w_b,
+                            bias,
+                            [ActivationFn::Tanh, ActivationFn::NoOP],
+                        )
+                    }
+                };
+
+                (
+                    extract_fanout_input_decode(lora_outputs.clone(), 0, batch_size, embedded_dim),
+                    extract_fanout_input_decode(lora_outputs, 1, batch_size, embedded_dim),
+                    None,
+                )
             }
         };
-
-        let weight_decay_lora_result =
-            extract_fanout_input_decode(lora_outputs.clone(), 0, batch_size, embedded_dim);
-        let learning_rate_pre_sigmoid =
-            extract_fanout_input_decode(lora_outputs, 1, batch_size, embedded_dim);
-        let value_input = extract_fanout_input_decode(mixed_inputs, 2, batch_size, embedded_dim);
 
         let value_from_first_cell: Tensor<B, 2> = if self.cell_id == 0 {
             value_precursor.clone()
@@ -468,12 +519,7 @@ impl<B: Backend> WeightPrepare<B> {
         let value = if self.cell_id != 0 {
             let nu_t = {
                 trace_lite_scope!("rwkv.infer.model.weight_prepare.value_residual_lora");
-                sigmoid(
-                    self.param_value_residual_lora
-                        .as_ref()
-                        .unwrap()
-                        .forward_2d(value_input),
-                )
+                sigmoid(value_residual_pre_sigmoid.expect("value residual pre-sigmoid missing"))
             };
 
             {
@@ -620,56 +666,105 @@ impl<B: Backend> WeightPrepare<B> {
             )
         };
 
-        let lora_outputs = {
+        let (weight_decay_lora_result, learning_rate_pre_sigmoid, value_residual_pre_sigmoid) = {
             trace_lite_scope!("rwkv.infer.model.weight_prepare.grouped_lora");
-            let lora_inputs = extract_fanout_group(
-                mixed_inputs.clone(),
-                3,
-                2,
-                batch_size,
-                context_length,
-                embedded_dim,
-            );
-            match self
-                .packed_infer
-                .as_ref()
-                .and_then(PackedWeightPrepareAny::downcast_ref::<B>)
-            {
-                Some(packed) => grouped_lora_forward_packed(
-                    lora_inputs,
-                    packed.lora_w_a.clone(),
-                    packed.lora_w_b.clone(),
-                    packed.lora_bias.clone(),
-                    [ActivationFn::Tanh, ActivationFn::NoOP],
-                ),
-                None => grouped_lora_forward(
-                    lora_inputs,
-                    [
-                        &self.param_weight_decay_lora,
-                        &self.param_learning_rate_lora,
-                    ],
-                    [ActivationFn::Tanh, ActivationFn::NoOP],
-                ),
-            }
-        };
-
-        let (weight_decay_lora_result, learning_rate_pre_sigmoid) = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.split_lora_outputs");
-            (
-                extract_fanout_input(
-                    lora_outputs.clone(),
-                    0,
+            if let Some(value_residual_lora) = self.param_value_residual_lora.as_ref() {
+                let lora_inputs = extract_fanout_inputs(
+                    mixed_inputs,
+                    [3, 4, 2],
                     batch_size,
                     context_length,
                     embedded_dim,
-                ),
-                extract_fanout_input(lora_outputs, 1, batch_size, context_length, embedded_dim),
-            )
-        };
+                );
+                let lora_outputs = match self
+                    .packed_infer
+                    .as_ref()
+                    .and_then(PackedWeightPrepareAny::downcast_ref::<B>)
+                {
+                    Some(packed) if packed.has_value_residual_lora => grouped_lora_forward_packed(
+                        lora_inputs,
+                        packed.lora_w_a.clone(),
+                        packed.lora_w_b.clone(),
+                        packed.lora_bias.clone(),
+                        [ActivationFn::Tanh, ActivationFn::NoOP, ActivationFn::NoOP],
+                    ),
+                    _ => grouped_lora_forward(
+                        lora_inputs,
+                        [
+                            &self.param_weight_decay_lora,
+                            &self.param_learning_rate_lora,
+                            value_residual_lora,
+                        ],
+                        [ActivationFn::Tanh, ActivationFn::NoOP, ActivationFn::NoOP],
+                    ),
+                };
 
-        let value_input = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.value_input");
-            extract_fanout_input(mixed_inputs, 2, batch_size, context_length, embedded_dim)
+                (
+                    extract_fanout_input(
+                        lora_outputs.clone(),
+                        0,
+                        batch_size,
+                        context_length,
+                        embedded_dim,
+                    ),
+                    extract_fanout_input(
+                        lora_outputs.clone(),
+                        1,
+                        batch_size,
+                        context_length,
+                        embedded_dim,
+                    ),
+                    Some(extract_fanout_input(
+                        lora_outputs,
+                        2,
+                        batch_size,
+                        context_length,
+                        embedded_dim,
+                    )),
+                )
+            } else {
+                let lora_inputs = extract_fanout_group(
+                    mixed_inputs,
+                    3,
+                    2,
+                    batch_size,
+                    context_length,
+                    embedded_dim,
+                );
+                let lora_outputs = match self
+                    .packed_infer
+                    .as_ref()
+                    .and_then(PackedWeightPrepareAny::downcast_ref::<B>)
+                {
+                    Some(packed) => grouped_lora_forward_packed(
+                        lora_inputs,
+                        packed.lora_w_a.clone(),
+                        packed.lora_w_b.clone(),
+                        packed.lora_bias.clone(),
+                        [ActivationFn::Tanh, ActivationFn::NoOP],
+                    ),
+                    None => grouped_lora_forward(
+                        lora_inputs,
+                        [
+                            &self.param_weight_decay_lora,
+                            &self.param_learning_rate_lora,
+                        ],
+                        [ActivationFn::Tanh, ActivationFn::NoOP],
+                    ),
+                };
+
+                (
+                    extract_fanout_input(
+                        lora_outputs.clone(),
+                        0,
+                        batch_size,
+                        context_length,
+                        embedded_dim,
+                    ),
+                    extract_fanout_input(lora_outputs, 1, batch_size, context_length, embedded_dim),
+                    None,
+                )
+            }
         };
 
         let value_from_first_cell = if self.cell_id == 0 {
@@ -696,12 +791,7 @@ impl<B: Backend> WeightPrepare<B> {
         let value = if self.cell_id != 0 {
             let nu_t = {
                 trace_lite_scope!("rwkv.infer.model.weight_prepare.value_residual_lora");
-                sigmoid(
-                    self.param_value_residual_lora
-                        .as_ref()
-                        .unwrap()
-                        .forward(value_input),
-                )
+                sigmoid(value_residual_pre_sigmoid.expect("value residual pre-sigmoid missing"))
             };
 
             {
@@ -824,6 +914,47 @@ fn extract_fanout_group_decode<B: Backend>(
     tensor.slice([start..(start + len), 0..batch_size, 0..embedded_dim])
 }
 
+fn extract_fanout_inputs<B: Backend, const N: usize>(
+    tensor: Tensor<B, 4>,
+    branch_indices: [usize; N],
+    batch_size: usize,
+    context_length: usize,
+    embedded_dim: usize,
+) -> Tensor<B, 4> {
+    Tensor::stack::<4>(
+        branch_indices
+            .into_iter()
+            .map(|branch_index| {
+                extract_fanout_input(
+                    tensor.clone(),
+                    branch_index,
+                    batch_size,
+                    context_length,
+                    embedded_dim,
+                )
+            })
+            .collect::<Vec<_>>(),
+        0,
+    )
+}
+
+fn extract_fanout_inputs_decode<B: Backend, const N: usize>(
+    tensor: Tensor<B, 3>,
+    branch_indices: [usize; N],
+    batch_size: usize,
+    embedded_dim: usize,
+) -> Tensor<B, 3> {
+    Tensor::stack::<3>(
+        branch_indices
+            .into_iter()
+            .map(|branch_index| {
+                extract_fanout_input_decode(tensor.clone(), branch_index, batch_size, embedded_dim)
+            })
+            .collect::<Vec<_>>(),
+        0,
+    )
+}
+
 fn build_mix_params<B: Backend>(weight_prepare: &WeightPrepare<B>) -> Tensor<B, 4> {
     Tensor::stack::<4>(
         vec![
@@ -896,14 +1027,26 @@ struct PackedGroupedLoRADecode<B: Backend> {
 }
 
 fn pack_grouped_lora<B: Backend, const N: usize>(loras: [&LoRA<B>; N]) -> PackedGroupedLoRA<B> {
+    let max_hidden_dim = loras
+        .iter()
+        .map(|lora| lora.w_a.val().dims()[1])
+        .max()
+        .expect("expected at least one LoRA");
+
     PackedGroupedLoRA {
         w_a: Tensor::stack::<3>(
-            loras.iter().map(|lora| lora.w_a.val()).collect::<Vec<_>>(),
+            loras
+                .iter()
+                .map(|lora| pad_lora_w_a(lora.w_a.val(), max_hidden_dim))
+                .collect::<Vec<_>>(),
             0,
         )
         .unsqueeze_dim::<4>(1),
         w_b: Tensor::stack::<3>(
-            loras.iter().map(|lora| lora.w_b.val()).collect::<Vec<_>>(),
+            loras
+                .iter()
+                .map(|lora| pad_lora_w_b(lora.w_b.val(), max_hidden_dim))
+                .collect::<Vec<_>>(),
             0,
         )
         .unsqueeze_dim::<4>(1),
@@ -914,6 +1057,38 @@ fn pack_grouped_lora<B: Backend, const N: usize>(loras: [&LoRA<B>; N]) -> Packed
                 .collect::<Vec<_>>(),
             0,
         ),
+    }
+}
+
+fn pad_lora_w_a<B: Backend>(w_a: Tensor<B, 2>, max_hidden_dim: usize) -> Tensor<B, 2> {
+    let [embedded_dim, hidden_dim] = w_a.dims();
+    if hidden_dim == max_hidden_dim {
+        w_a
+    } else {
+        let device = w_a.device();
+        Tensor::cat(
+            vec![
+                w_a,
+                Tensor::zeros([embedded_dim, max_hidden_dim - hidden_dim], &device),
+            ],
+            1,
+        )
+    }
+}
+
+fn pad_lora_w_b<B: Backend>(w_b: Tensor<B, 2>, max_hidden_dim: usize) -> Tensor<B, 2> {
+    let [hidden_dim, embedded_dim] = w_b.dims();
+    if hidden_dim == max_hidden_dim {
+        w_b
+    } else {
+        let device = w_b.device();
+        Tensor::cat(
+            vec![
+                w_b,
+                Tensor::zeros([max_hidden_dim - hidden_dim, embedded_dim], &device),
+            ],
+            0,
+        )
     }
 }
 
