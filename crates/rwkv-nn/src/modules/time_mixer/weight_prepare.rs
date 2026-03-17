@@ -221,13 +221,13 @@ impl<B: Backend> WeightPrepare<B> {
         embedded_token_shift: Option<Tensor<B, 2>>,
         context_mask: Option<Tensor<B, 2>>,
     ) -> WeightPrepareOutput<B> {
-        let [_, context_length, _] = embedded_context.dims();
+        let [_, _context_length, _] = embedded_context.dims();
         let token_shifted_diff = {
             #[cfg(feature = "trace")]
             let _token_shift_scope = tracing::trace_span!(
                 "rwkv.infer.model.weight_prepare.token_shift_diff",
                 cell_id = self.cell_id,
-                context_length
+                context_length = _context_length
             )
             .entered();
             token_shift_diff(
@@ -268,12 +268,12 @@ impl<B: Backend> WeightPrepare<B> {
 
         let mix_params = {
             trace_lite_scope!("rwkv.infer.model.weight_prepare.scale_diff");
-            Tensor::stack(
+            Tensor::stack::<4>(
                 vec![
                     self.param_receptance.val(),
-                    self.param_weight_decay.val(),
                     self.param_key.val(),
                     self.param_value.val(),
+                    self.param_weight_decay.val(),
                     self.param_learning_rate.val(),
                 ],
                 0,
@@ -286,54 +286,96 @@ impl<B: Backend> WeightPrepare<B> {
                 + token_shifted_diff.clone().unsqueeze_dim(0) * mix_params
         };
 
-        let (receptance_input, weight_decay_input, key_input, value_input, learning_rate_input) = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.split_inputs");
+        let projection_outputs = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.grouped_projection");
+            let projection_inputs = extract_fanout_group(
+                mixed_inputs.clone(),
+                0,
+                3,
+                batch_size,
+                context_length,
+                embedded_dim,
+            );
+            grouped_linear_forward(
+                projection_inputs,
+                [
+                    &self.projection_receptance,
+                    &self.projection_key,
+                    &self.projection_value,
+                ],
+            )
+        };
+
+        let (receptance, key_precursor, value_precursor) = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.split_projection_outputs");
             (
                 extract_fanout_input(
-                    mixed_inputs.clone(),
+                    projection_outputs.clone(),
                     0,
                     batch_size,
                     context_length,
                     embedded_dim,
                 ),
                 extract_fanout_input(
-                    mixed_inputs.clone(),
+                    projection_outputs.clone(),
                     1,
                     batch_size,
                     context_length,
                     embedded_dim,
                 ),
                 extract_fanout_input(
-                    mixed_inputs.clone(),
+                    projection_outputs,
                     2,
                     batch_size,
                     context_length,
                     embedded_dim,
                 ),
+            )
+        };
+
+        let lora_outputs = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.grouped_lora");
+            let lora_inputs = extract_fanout_group(
+                mixed_inputs.clone(),
+                3,
+                2,
+                batch_size,
+                context_length,
+                embedded_dim,
+            );
+            grouped_lora_forward(
+                lora_inputs,
+                [
+                    &self.param_weight_decay_lora,
+                    &self.param_learning_rate_lora,
+                ],
+                [ActivationFn::Tanh, ActivationFn::NoOP],
+            )
+        };
+
+        let (weight_decay_lora_result, learning_rate_pre_sigmoid) = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.split_lora_outputs");
+            (
                 extract_fanout_input(
-                    mixed_inputs.clone(),
-                    3,
+                    lora_outputs.clone(),
+                    0,
                     batch_size,
                     context_length,
                     embedded_dim,
                 ),
-                extract_fanout_input(mixed_inputs, 4, batch_size, context_length, embedded_dim),
+                extract_fanout_input(
+                    lora_outputs,
+                    1,
+                    batch_size,
+                    context_length,
+                    embedded_dim,
+                ),
             )
         };
 
-        let receptance = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.projection_receptance");
-            self.projection_receptance.forward(receptance_input)
-        };
-
-        let key_precursor = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.projection_key");
-            self.projection_key.forward(key_input)
-        };
-
-        let value_precursor = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.projection_value");
-            self.projection_value.forward(value_input.clone())
+        let value_input = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.value_input");
+            extract_fanout_input(mixed_inputs, 2, batch_size, context_length, embedded_dim)
         };
 
         let value_from_first_cell = if self.cell_id == 0 {
@@ -344,7 +386,7 @@ impl<B: Backend> WeightPrepare<B> {
 
         let learning_rate = {
             trace_lite_scope!("rwkv.infer.model.weight_prepare.learning_rate_lora");
-            sigmoid(self.param_learning_rate_lora.forward(learning_rate_input))
+            sigmoid(learning_rate_pre_sigmoid)
         };
 
         let alpha_modulated = {
@@ -376,13 +418,8 @@ impl<B: Backend> WeightPrepare<B> {
             value_precursor
         };
 
-        let weight_decay_lora_result = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.weight_decay_lora");
-            self.param_weight_decay_lora.forward(weight_decay_input)
-        };
-
         let weight_decay = {
-            trace_lite_scope!("rwkv.infer.model.weight_prepare.weight_decay_post");
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.weight_decay_lora");
             -softplus(-weight_decay_lora_result, 1.0) - 0.5
         };
 
@@ -435,14 +472,14 @@ pub struct WeightPrepareOutput<B: Backend> {
     pub replacement: Tensor<B, 3>,
 }
 
-fn extract_fanout_input<B: Backend>(
-    mixed_inputs: Tensor<B, 4>,
+fn extract_fanout_input<B: Backend, const D: usize>(
+    tensor: Tensor<B, D>,
     branch_index: usize,
     batch_size: usize,
     context_length: usize,
     embedded_dim: usize,
 ) -> Tensor<B, 3> {
-    mixed_inputs
+    tensor
         .slice([
             branch_index..(branch_index + 1),
             0..batch_size,
@@ -450,6 +487,97 @@ fn extract_fanout_input<B: Backend>(
             0..embedded_dim,
         ])
         .squeeze_dim(0)
+}
+
+fn extract_fanout_group<B: Backend>(
+    tensor: Tensor<B, 4>,
+    start: usize,
+    len: usize,
+    batch_size: usize,
+    context_length: usize,
+    embedded_dim: usize,
+) -> Tensor<B, 4> {
+    tensor.slice([
+        start..(start + len),
+        0..batch_size,
+        0..context_length,
+        0..embedded_dim,
+    ])
+}
+
+fn grouped_linear_forward<B: Backend, const N: usize>(
+    input: Tensor<B, 4>,
+    linears: [&Linear<B>; N],
+) -> Tensor<B, 4> {
+    let weights = Tensor::stack::<3>(
+        linears
+            .iter()
+            .map(|linear| linear.weight.val())
+            .collect::<Vec<_>>(),
+        0,
+    )
+    .unsqueeze_dim::<4>(1);
+
+    input.matmul(weights)
+}
+
+fn grouped_lora_forward<B: Backend, const N: usize>(
+    input: Tensor<B, 4>,
+    loras: [&LoRA<B>; N],
+    activation_fns: [ActivationFn; N],
+) -> Tensor<B, 4> {
+    let w_a = Tensor::stack::<3>(
+        loras
+            .iter()
+            .map(|lora| lora.w_a.val())
+            .collect::<Vec<_>>(),
+        0,
+    )
+    .unsqueeze_dim::<4>(1);
+    let w_b = Tensor::stack::<3>(
+        loras
+            .iter()
+            .map(|lora| lora.w_b.val())
+            .collect::<Vec<_>>(),
+        0,
+    )
+    .unsqueeze_dim::<4>(1);
+    let bias: Tensor<B, 4> = Tensor::stack::<4>(
+        loras
+            .iter()
+            .map(|lora| lora.bias.as_ref().expect("expected LoRA bias").val())
+            .collect::<Vec<_>>(),
+        0,
+    );
+
+    let hidden = input.matmul(w_a);
+    let [group_size, batch_size, context_length, hidden_dim] = hidden.dims();
+
+    let activated: Tensor<B, 4> = Tensor::stack::<4>(
+        activation_fns
+            .into_iter()
+            .enumerate()
+            .map(|(index, activation_fn)| {
+                let branch_hidden = extract_fanout_input(
+                    hidden.clone(),
+                    index,
+                    batch_size,
+                    context_length,
+                    hidden_dim,
+                );
+
+                match activation_fn {
+                    ActivationFn::Sigmoid => sigmoid(branch_hidden),
+                    ActivationFn::Tanh => burn::tensor::activation::tanh(branch_hidden),
+                    ActivationFn::NoOP => branch_hidden,
+                }
+            })
+            .collect::<Vec<_>>(),
+        0,
+    );
+    debug_assert_eq!(group_size, N);
+
+    activated.matmul(w_b) + bias
 }
 
 impl<B: Backend> WeightPrepareOutput<B> {

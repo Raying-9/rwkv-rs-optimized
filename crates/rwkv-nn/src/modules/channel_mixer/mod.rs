@@ -106,13 +106,13 @@ impl<B: Backend> ChannelMixer<B> {
             get_embedded_token_shift(embedded_context.clone())
         });
 
-        let [_, context_length, _] = embedded_context.dims();
+        let [_, _context_length, _] = embedded_context.dims();
         let token_shifted_diff = {
             #[cfg(feature = "trace")]
             let _token_shift_scope = tracing::trace_span!(
                 "rwkv.infer.model.channel_mixer.token_shift_diff",
                 cell_id = self.cell_id,
-                context_length
+                context_length = _context_length
             )
             .entered();
             token_shift_diff(
