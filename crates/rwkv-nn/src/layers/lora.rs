@@ -116,6 +116,26 @@ impl<B: Backend> LoRA<B> {
             None => x,
         }
     }
+
+    pub fn forward_2d(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        let x = x.matmul(self.w_a.val());
+
+        let x = match self.activation_fn {
+            ActivationFn::Sigmoid => sigmoid(x),
+            ActivationFn::Tanh => tanh(x),
+            ActivationFn::NoOP => x,
+        };
+
+        let x = x.matmul(self.w_b.val());
+
+        match &self.bias {
+            Some(bias) => {
+                let bias: Tensor<B, 1> = bias.val().squeeze_dim::<2>(0).squeeze_dim::<1>(0);
+                bias.unsqueeze_dim(0) + x
+            }
+            None => x,
+        }
+    }
 }
 
 #[derive(Module, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

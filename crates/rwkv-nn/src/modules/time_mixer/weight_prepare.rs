@@ -48,10 +48,15 @@ pub struct WeightPrepareConfig {
 #[derive(Clone, Debug)]
 struct PackedWeightPrepare<B: Backend> {
     mix_params: Tensor<B, 4>,
+    mix_params_decode: Tensor<B, 3>,
     projection_weights: Tensor<B, 4>,
+    projection_weights_decode: Tensor<B, 3>,
     lora_w_a: Tensor<B, 4>,
+    lora_w_a_decode: Tensor<B, 3>,
     lora_w_b: Tensor<B, 4>,
+    lora_w_b_decode: Tensor<B, 3>,
     lora_bias: Tensor<B, 4>,
+    lora_bias_decode: Tensor<B, 3>,
 }
 
 #[derive(Clone)]
@@ -259,16 +264,24 @@ impl<B: Backend> WeightPrepare<B> {
             &self.param_learning_rate_lora,
         ]);
 
+        let mix_params = build_mix_params(self);
+        let projection_weights = pack_grouped_linear_weights([
+            &self.projection_receptance,
+            &self.projection_key,
+            &self.projection_value,
+        ]);
+
         self.packed_infer = Ignored(Some(PackedWeightPrepareAny::new(PackedWeightPrepare {
-            mix_params: build_mix_params(self),
-            projection_weights: pack_grouped_linear_weights([
-                &self.projection_receptance,
-                &self.projection_key,
-                &self.projection_value,
-            ]),
-            lora_w_a,
-            lora_w_b,
-            lora_bias,
+            mix_params: mix_params.clone(),
+            mix_params_decode: mix_params.squeeze_dim(1),
+            projection_weights: projection_weights.clone(),
+            projection_weights_decode: projection_weights.squeeze_dim(1),
+            lora_w_a: lora_w_a.clone(),
+            lora_w_a_decode: lora_w_a.squeeze_dim(1),
+            lora_w_b: lora_w_b.clone(),
+            lora_w_b_decode: lora_w_b.squeeze_dim(1),
+            lora_bias: lora_bias.clone(),
+            lora_bias_decode: lora_bias.squeeze_dim(1),
         })));
     }
 
@@ -313,11 +326,204 @@ impl<B: Backend> WeightPrepare<B> {
             }
         };
 
-        self.forward_with_token_shifted_diff(
-            embedded_context,
-            value_from_first_cell,
-            token_shifted_diff,
-        )
+        if _context_length == 1 {
+            self.forward_decode_with_token_shifted_diff(
+                embedded_context,
+                value_from_first_cell,
+                token_shifted_diff,
+            )
+        } else {
+            self.forward_with_token_shifted_diff(
+                embedded_context,
+                value_from_first_cell,
+                token_shifted_diff,
+            )
+        }
+    }
+
+    fn forward_decode_with_token_shifted_diff(
+        &self,
+        embedded_context: Tensor<B, 3>,
+        value_from_first_cell: Tensor<B, 3>,
+        token_shifted_diff: Tensor<B, 3>,
+    ) -> WeightPrepareOutput<B> {
+        let [batch_size, context_length, embedded_dim] = embedded_context.dims();
+        debug_assert_eq!(context_length, 1);
+
+        let (num_heads, head_size) = (self.num_heads, self.head_size);
+        let packed = self
+            .packed_infer
+            .as_ref()
+            .and_then(PackedWeightPrepareAny::downcast_ref::<B>);
+
+        let embedded_context: Tensor<B, 2> = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.decode_embedded_context");
+            embedded_context.squeeze_dim(1)
+        };
+        let token_shifted_diff: Tensor<B, 2> = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.decode_token_shifted_diff");
+            token_shifted_diff.squeeze_dim(1)
+        };
+
+        let mix_params = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.scale_diff");
+            packed
+                .map(|packed| packed.mix_params_decode.clone())
+                .unwrap_or_else(|| build_mix_params_decode(self))
+        };
+
+        let mixed_inputs = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.mix_inputs_decode");
+            embedded_context.unsqueeze_dim(0)
+                + token_shifted_diff.clone().unsqueeze_dim(0) * mix_params
+        };
+
+        let projection_outputs = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.grouped_projection_decode");
+            let projection_inputs =
+                extract_fanout_group_decode(mixed_inputs.clone(), 0, 3, batch_size, embedded_dim);
+            match packed {
+                Some(packed) => grouped_linear_forward_decode(
+                    projection_inputs,
+                    packed.projection_weights_decode.clone(),
+                ),
+                None => grouped_linear_forward_decode(
+                    projection_inputs,
+                    pack_grouped_linear_weights_decode([
+                        &self.projection_receptance,
+                        &self.projection_key,
+                        &self.projection_value,
+                    ]),
+                ),
+            }
+        };
+
+        let receptance =
+            extract_fanout_input_decode(projection_outputs.clone(), 0, batch_size, embedded_dim);
+        let key_precursor =
+            extract_fanout_input_decode(projection_outputs.clone(), 1, batch_size, embedded_dim);
+        let value_precursor =
+            extract_fanout_input_decode(projection_outputs, 2, batch_size, embedded_dim);
+
+        let lora_outputs = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.grouped_lora_decode");
+            let lora_inputs =
+                extract_fanout_group_decode(mixed_inputs.clone(), 3, 2, batch_size, embedded_dim);
+            match packed {
+                Some(packed) => grouped_lora_forward_decode(
+                    lora_inputs,
+                    packed.lora_w_a_decode.clone(),
+                    packed.lora_w_b_decode.clone(),
+                    packed.lora_bias_decode.clone(),
+                    [ActivationFn::Tanh, ActivationFn::NoOP],
+                ),
+                None => {
+                    let PackedGroupedLoRADecode { w_a, w_b, bias } = pack_grouped_lora_decode([
+                        &self.param_weight_decay_lora,
+                        &self.param_learning_rate_lora,
+                    ]);
+                    grouped_lora_forward_decode(
+                        lora_inputs,
+                        w_a,
+                        w_b,
+                        bias,
+                        [ActivationFn::Tanh, ActivationFn::NoOP],
+                    )
+                }
+            }
+        };
+
+        let weight_decay_lora_result =
+            extract_fanout_input_decode(lora_outputs.clone(), 0, batch_size, embedded_dim);
+        let learning_rate_pre_sigmoid =
+            extract_fanout_input_decode(lora_outputs, 1, batch_size, embedded_dim);
+        let value_input = extract_fanout_input_decode(mixed_inputs, 2, batch_size, embedded_dim);
+
+        let value_from_first_cell: Tensor<B, 2> = if self.cell_id == 0 {
+            value_precursor.clone()
+        } else {
+            value_from_first_cell.squeeze_dim(1)
+        };
+
+        let learning_rate = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.learning_rate_lora");
+            sigmoid(learning_rate_pre_sigmoid)
+        };
+
+        let alpha_modulated = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.alpha_modulated");
+            let param_key_replacement: Tensor<B, 1> = self
+                .param_key_replacement
+                .val()
+                .squeeze_dim::<2>(0)
+                .squeeze_dim::<1>(0);
+            param_key_replacement.unsqueeze_dim(0) * (learning_rate.clone() - 1.0) + 1.0
+        };
+
+        let replacement_key = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.replacement_key");
+            key_precursor.clone() * alpha_modulated
+        };
+
+        let value = if self.cell_id != 0 {
+            let nu_t = {
+                trace_lite_scope!("rwkv.infer.model.weight_prepare.value_residual_lora");
+                sigmoid(
+                    self.param_value_residual_lora
+                        .as_ref()
+                        .unwrap()
+                        .forward_2d(value_input),
+                )
+            };
+
+            {
+                trace_lite_scope!("rwkv.infer.model.weight_prepare.value_residual_mix");
+                lerp(value_precursor, value_from_first_cell.clone(), nu_t)
+            }
+        } else {
+            value_precursor
+        };
+
+        let weight_decay = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.weight_decay_lora");
+            -softplus(-weight_decay_lora_result, 1.0) - 0.5
+        };
+
+        let removal_key = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.removal_key");
+            let param_key_removal: Tensor<B, 1> = self
+                .param_key_removal
+                .val()
+                .squeeze_dim::<2>(0)
+                .squeeze_dim::<1>(0);
+            key_precursor * param_key_removal.unsqueeze_dim(0)
+        };
+
+        let removal_key_reshaped = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.removal_key_reshape");
+            removal_key.reshape([batch_size, num_heads, head_size])
+        };
+
+        let removal_key_normalized = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.normalize_removal_key");
+            -normalize(removal_key_reshaped, 2.0, -1, 1e-12).reshape([batch_size, embedded_dim])
+        };
+
+        let replacement = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.replacement");
+            -removal_key_normalized.clone() * learning_rate
+        };
+
+        WeightPrepareOutput {
+            token_shifted_diff: token_shifted_diff.unsqueeze_dim(1),
+            value_from_first_cell: value_from_first_cell.unsqueeze_dim(1),
+            receptance: receptance.unsqueeze_dim(1),
+            weight_decay: weight_decay.unsqueeze_dim(1),
+            replacement_key: replacement_key.unsqueeze_dim(1),
+            value: value.unsqueeze_dim(1),
+            removal_key_normalized: removal_key_normalized.unsqueeze_dim(1),
+            replacement: replacement.unsqueeze_dim(1),
+        }
     }
 
     fn forward_with_token_shifted_diff(
@@ -577,6 +783,21 @@ fn extract_fanout_input<B: Backend, const D: usize>(
         .squeeze_dim(0)
 }
 
+fn extract_fanout_input_decode<B: Backend>(
+    tensor: Tensor<B, 3>,
+    branch_index: usize,
+    batch_size: usize,
+    embedded_dim: usize,
+) -> Tensor<B, 2> {
+    tensor
+        .slice([
+            branch_index..(branch_index + 1),
+            0..batch_size,
+            0..embedded_dim,
+        ])
+        .squeeze_dim(0)
+}
+
 fn extract_fanout_group<B: Backend>(
     tensor: Tensor<B, 4>,
     start: usize,
@@ -593,6 +814,16 @@ fn extract_fanout_group<B: Backend>(
     ])
 }
 
+fn extract_fanout_group_decode<B: Backend>(
+    tensor: Tensor<B, 3>,
+    start: usize,
+    len: usize,
+    batch_size: usize,
+    embedded_dim: usize,
+) -> Tensor<B, 3> {
+    tensor.slice([start..(start + len), 0..batch_size, 0..embedded_dim])
+}
+
 fn build_mix_params<B: Backend>(weight_prepare: &WeightPrepare<B>) -> Tensor<B, 4> {
     Tensor::stack::<4>(
         vec![
@@ -606,6 +837,10 @@ fn build_mix_params<B: Backend>(weight_prepare: &WeightPrepare<B>) -> Tensor<B, 
     )
 }
 
+fn build_mix_params_decode<B: Backend>(weight_prepare: &WeightPrepare<B>) -> Tensor<B, 3> {
+    build_mix_params(weight_prepare).squeeze_dim(1)
+}
+
 fn pack_grouped_linear_weights<B: Backend, const N: usize>(
     linears: [&Linear<B>; N],
 ) -> Tensor<B, 4> {
@@ -617,6 +852,12 @@ fn pack_grouped_linear_weights<B: Backend, const N: usize>(
         0,
     )
     .unsqueeze_dim::<4>(1)
+}
+
+fn pack_grouped_linear_weights_decode<B: Backend, const N: usize>(
+    linears: [&Linear<B>; N],
+) -> Tensor<B, 3> {
+    pack_grouped_linear_weights(linears).squeeze_dim(1)
 }
 
 fn grouped_linear_forward<B: Backend, const N: usize>(
@@ -633,11 +874,25 @@ fn grouped_linear_forward_packed<B: Backend>(
     input.matmul(weights)
 }
 
+fn grouped_linear_forward_decode<B: Backend>(
+    input: Tensor<B, 3>,
+    weights: Tensor<B, 3>,
+) -> Tensor<B, 3> {
+    input.matmul(weights)
+}
+
 #[derive(Debug)]
 struct PackedGroupedLoRA<B: Backend> {
     w_a: Tensor<B, 4>,
     w_b: Tensor<B, 4>,
     bias: Tensor<B, 4>,
+}
+
+#[derive(Debug)]
+struct PackedGroupedLoRADecode<B: Backend> {
+    w_a: Tensor<B, 3>,
+    w_b: Tensor<B, 3>,
+    bias: Tensor<B, 3>,
 }
 
 fn pack_grouped_lora<B: Backend, const N: usize>(loras: [&LoRA<B>; N]) -> PackedGroupedLoRA<B> {
@@ -659,6 +914,17 @@ fn pack_grouped_lora<B: Backend, const N: usize>(loras: [&LoRA<B>; N]) -> Packed
                 .collect::<Vec<_>>(),
             0,
         ),
+    }
+}
+
+fn pack_grouped_lora_decode<B: Backend, const N: usize>(
+    loras: [&LoRA<B>; N],
+) -> PackedGroupedLoRADecode<B> {
+    let PackedGroupedLoRA { w_a, w_b, bias } = pack_grouped_lora(loras);
+    PackedGroupedLoRADecode {
+        w_a: w_a.squeeze_dim(1),
+        w_b: w_b.squeeze_dim(1),
+        bias: bias.squeeze_dim(1),
     }
 }
 
@@ -693,6 +959,38 @@ fn grouped_lora_forward_packed<B: Backend, const N: usize>(
                     context_length,
                     hidden_dim,
                 );
+
+                match activation_fn {
+                    ActivationFn::Sigmoid => sigmoid(branch_hidden),
+                    ActivationFn::Tanh => burn::tensor::activation::tanh(branch_hidden),
+                    ActivationFn::NoOP => branch_hidden,
+                }
+            })
+            .collect::<Vec<_>>(),
+        0,
+    );
+    debug_assert_eq!(group_size, N);
+
+    activated.matmul(w_b) + bias
+}
+
+fn grouped_lora_forward_decode<B: Backend, const N: usize>(
+    input: Tensor<B, 3>,
+    w_a: Tensor<B, 3>,
+    w_b: Tensor<B, 3>,
+    bias: Tensor<B, 3>,
+    activation_fns: [ActivationFn; N],
+) -> Tensor<B, 3> {
+    let hidden = input.matmul(w_a);
+    let [group_size, batch_size, hidden_dim] = hidden.dims();
+
+    let activated: Tensor<B, 3> = Tensor::stack::<3>(
+        activation_fns
+            .into_iter()
+            .enumerate()
+            .map(|(index, activation_fn)| {
+                let branch_hidden =
+                    extract_fanout_input_decode(hidden.clone(), index, batch_size, hidden_dim);
 
                 match activation_fn {
                     ActivationFn::Sigmoid => sigmoid(branch_hidden),
