@@ -134,6 +134,12 @@ Implemented so far:
 - `weight_prepare` now folds `value_residual_lora` into the grouped LoRA path when present
 - because LoRA ranks differ across branches, grouped packing now pads to the max rank with zeros
   during inference cache prep and fallback packing
+- `gated_readout` now prepares inference-only packed tensors for:
+  - `param_gate`
+  - output gate LoRA weights
+  - receptance-key bonus scale
+  - output projection weight
+- `gated_readout.forward()` and its decode fast path now reuse those packed tensors when available
 
 ## Phase 4: specialized normalization and gated readout cleanup
 

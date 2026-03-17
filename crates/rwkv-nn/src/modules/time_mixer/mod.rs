@@ -146,6 +146,7 @@ impl<B: Backend> TimeMixer<B> {
 
     pub fn prepare_inference_cache(&mut self) {
         self.weight_prepare.prepare_inference_cache();
+        self.gated_readout.prepare_inference_cache();
     }
 
     #[cfg_attr(
