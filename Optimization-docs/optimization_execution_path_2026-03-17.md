@@ -102,11 +102,14 @@ Implemented so far:
 - added a decode-specialized `token_shift_diff_decode()` helper
 - `weight_prepare` now routes `context_length == 1` through the decode helper
 - `channel_mixer` now routes `context_length == 1` through the decode helper
+- `weight_prepare` now has a decode-specialized inner execution path using 2D grouped inputs
+- `channel_mixer` now has a decode-specialized 2D execution path
 
 Remaining:
 
 - push the decode branch further down so mixed inputs themselves can be built directly without
   the generic fanout-shaped tensor path
+- evaluate whether `gated_readout` also needs a decode-specialized path
 
 ## Phase 3: extend fanout fusion to remaining branches
 

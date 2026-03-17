@@ -92,6 +92,11 @@ impl<B: Backend> ChannelMixer<B> {
             context_mask,
         } = channel_mixer_input;
 
+        let [_, context_length, _] = embedded_context.dims();
+        if context_length == 1 {
+            return self.forward_decode(embedded_context, embedded_token_shift, context_mask);
+        }
+
         // `context_mask` handles physical left padding (and inactive lanes for batching).
         // Padding timesteps must be strict no-ops for the token-shift state; otherwise the
         // first real token would see an incorrect previous token.
@@ -161,6 +166,92 @@ impl<B: Backend> ChannelMixer<B> {
 
         ChannelMixerIO {
             embedded_context: value,
+            embedded_token_shift: output_embedded_token_shift,
+            context_mask,
+        }
+    }
+
+    fn forward_decode(
+        &self,
+        embedded_context: Tensor<B, 3>,
+        embedded_token_shift: Option<Tensor<B, 2>>,
+        context_mask: Option<Tensor<B, 2>>,
+    ) -> ChannelMixerIO<B> {
+        let [batch_size, context_length, _embedded_dim] = embedded_context.dims();
+        debug_assert_eq!(context_length, 1);
+
+        let embedded_context_2d: Tensor<B, 2> = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.decode_embedded_context");
+            embedded_context.squeeze_dim(1)
+        };
+
+        let mask_2d: Option<Tensor<B, 2>> = context_mask
+            .clone()
+            .map(|mask| mask.reshape([batch_size, 1]));
+
+        let embedded_context_2d = match mask_2d.as_ref() {
+            Some(mask) => {
+                trace_lite_scope!("rwkv.infer.model.channel_mixer.apply_context_mask_decode");
+                embedded_context_2d * mask.clone()
+            }
+            None => embedded_context_2d,
+        };
+
+        let output_embedded_token_shift = embedded_token_shift.as_ref().map(|_| {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.output_shift_decode");
+            embedded_context_2d.clone()
+        });
+
+        let token_shifted_diff: Tensor<B, 2> = {
+            #[cfg(feature = "trace")]
+            let _token_shift_scope = tracing::trace_span!(
+                "rwkv.infer.model.channel_mixer.token_shift_diff_decode_specialized",
+                cell_id = self.cell_id
+            )
+            .entered();
+            token_shift_diff_decode(
+                embedded_context_2d.clone().unsqueeze_dim(1),
+                embedded_token_shift,
+                context_mask.clone(),
+            )
+            .squeeze_dim(1)
+        };
+
+        let token_shift_diff_scale: Tensor<B, 1> = self
+            .token_shift_diff_scale
+            .val()
+            .squeeze_dim::<2>(0)
+            .squeeze_dim::<1>(0);
+
+        let embedded_context_shift = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.shift_mix_decode");
+            embedded_context_2d.clone()
+                + token_shifted_diff * token_shift_diff_scale.unsqueeze_dim(0)
+        };
+
+        let activated_key = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.projection_key_decode");
+            self.key.forward(embedded_context_shift)
+        };
+        let activated_key = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.activation_decode");
+            relu(activated_key).powf_scalar(2.0)
+        };
+
+        let value = {
+            trace_lite_scope!("rwkv.infer.model.channel_mixer.projection_value_decode");
+            self.value.forward(activated_key)
+        };
+        let value = match mask_2d {
+            Some(mask) => {
+                trace_lite_scope!("rwkv.infer.model.channel_mixer.output_mask_decode");
+                value * mask
+            }
+            None => value,
+        };
+
+        ChannelMixerIO {
+            embedded_context: value.unsqueeze_dim(1),
             embedded_token_shift: output_embedded_token_shift,
             context_mask,
         }
