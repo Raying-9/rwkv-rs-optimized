@@ -1,7 +1,6 @@
-use burn::backend::wgpu::{BoolElement, CubeBackend, FloatElement, IntElement};
 use burn::tensor::{Shape, ops::FloatTensor};
 use burn_cubecl::{
-    CubeElement, CubeRuntime,
+    BoolElement, CubeBackend, CubeElement, CubeRuntime, FloatElement, IntElement,
     cubecl::{CubeCount, CubeDim},
     kernel::into_contiguous,
     ops::numeric::empty_device,

@@ -31,12 +31,12 @@ cubecl = ["burn/cubecl", "dep:burn-cubecl"]
 autotune = ["burn/autotune"]
 autotune-checks = ["burn/autotune-checks"]
 
-wgpu = ["cubecl", "burn/wgpu"]
-vulkan = ["wgpu", "burn/vulkan"]
-webgpu = ["wgpu", "burn/webgpu"]
-metal = ["wgpu", "burn/metal"]
-cuda = ["cubecl", "burn/cuda"]
-rocm = ["cubecl", "burn/rocm"]
+wgpu = ["cubecl", "burn/wgpu", "rwkv-nn?/wgpu"]
+vulkan = ["wgpu", "burn/vulkan", "rwkv-nn?/vulkan"]
+webgpu = ["wgpu", "burn/webgpu", "rwkv-nn?/webgpu"]
+metal = ["wgpu", "burn/metal", "rwkv-nn?/metal"]
+cuda = ["cubecl", "burn/cuda", "rwkv-nn?/cuda"]
+rocm = ["cubecl", "burn/rocm", "rwkv-nn?/rocm"]
 cpu = ["burn/cpu"]
 trace = [
     "dep:tracing",

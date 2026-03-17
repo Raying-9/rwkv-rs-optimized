@@ -80,7 +80,7 @@ pub fn init_tracing(service: &'static str, cfg: TraceConfig) -> Result<TraceMode
             .with_target(true)
             .with_thread_ids(true)
             .with_thread_names(true)
-            .with_ansi(cfg.with_ansi);
+            .with_ansi(cfg.with_ansi && cfg.mode == TraceMode::Console);
 
         let init_result = match cfg.mode {
             TraceMode::Off => Ok(()),

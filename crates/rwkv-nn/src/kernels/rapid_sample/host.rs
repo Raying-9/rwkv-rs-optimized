@@ -1,10 +1,9 @@
-use burn::backend::wgpu::{BoolElement, CubeBackend, FloatElement, IntElement};
 use burn::tensor::{
     DType, Shape,
     ops::{FloatTensor, IntTensor},
 };
 use burn_cubecl::{
-    CubeRuntime,
+    BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement,
     cubecl::prelude::ScalarArg,
     cubecl::{CubeCount, CubeDim},
     kernel::{cast, into_contiguous},

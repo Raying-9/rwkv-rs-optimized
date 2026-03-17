@@ -1,5 +1,17 @@
 use burn::{Tensor, prelude::Backend};
 
+#[cfg(feature = "trace")]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {
+        let _rwkv_trace_scope = tracing::trace_span!($name).entered();
+    };
+}
+
+#[cfg(not(feature = "trace"))]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {};
+}
+
 pub fn token_shift<B: Backend>(
     embedded_context: Tensor<B, 3>,
     embedded_token_shift: Option<Tensor<B, 2>>,
@@ -19,19 +31,23 @@ pub fn token_shift<B: Backend>(
 
     // Decode path is typically T=1; skip generic concat/mask plumbing in this case.
     if context_length == 1 {
+        trace_lite_scope!("rwkv.infer.model.token_shift.decode_fastpath");
         return embedded_token_shift.unsqueeze_dim(1);
     }
 
     // Standard previous-token shift: [shift, x[:, 0..T-1]].
-    let shifted = Tensor::cat(
-        vec![
-            embedded_token_shift.clone().unsqueeze_dim(1),
-            embedded_context
-                .clone()
-                .slice([0..batch_size, 0..(context_length - 1)]),
-        ],
-        1,
-    );
+    let shifted = {
+        trace_lite_scope!("rwkv.infer.model.token_shift.shifted_cat");
+        Tensor::cat(
+            vec![
+                embedded_token_shift.clone().unsqueeze_dim(1),
+                embedded_context
+                    .clone()
+                    .slice([0..batch_size, 0..(context_length - 1)]),
+            ],
+            1,
+        )
+    };
 
     let Some(context_mask) = context_mask else {
         return shifted;
@@ -45,23 +61,34 @@ pub fn token_shift<B: Backend>(
     );
 
     // `prev_valid_mask[t] = context_mask[t-1]` (t=0 treated as 0).
-    let prev_valid_mask = Tensor::cat(
-        vec![
-            Tensor::zeros([batch_size, 1], &embedded_context.device()),
-            context_mask
-                .clone()
-                .slice([0..batch_size, 0..(context_length - 1)]),
-        ],
-        1,
-    );
+    let prev_valid_mask = {
+        trace_lite_scope!("rwkv.infer.model.token_shift.prev_valid_mask");
+        Tensor::cat(
+            vec![
+                Tensor::zeros([batch_size, 1], &embedded_context.device()),
+                context_mask
+                    .clone()
+                    .slice([0..batch_size, 0..(context_length - 1)]),
+            ],
+            1,
+        )
+    };
 
     // If the previous timestep is masked (padding), keep using the external shift state.
     // This handles left padding where the prefix padding should not advance the previous token.
-    let use_external_shift =
-        Tensor::ones([batch_size, context_length], &embedded_context.device()) - prev_valid_mask;
+    let use_external_shift = {
+        trace_lite_scope!("rwkv.infer.model.token_shift.use_external_shift");
+        Tensor::ones([batch_size, context_length], &embedded_context.device()) - prev_valid_mask
+    };
 
-    let external_shift = embedded_token_shift.unsqueeze_dim(1);
-    shifted.clone() + use_external_shift.unsqueeze_dim(2) * (external_shift - shifted)
+    let external_shift = {
+        trace_lite_scope!("rwkv.infer.model.token_shift.external_shift");
+        embedded_token_shift.unsqueeze_dim(1)
+    };
+    {
+        trace_lite_scope!("rwkv.infer.model.token_shift.masked_blend");
+        shifted.clone() + use_external_shift.unsqueeze_dim(2) * (external_shift - shifted)
+    }
 }
 
 pub fn get_embedded_token_shift<B: Backend>(embedded_context: Tensor<B, 3>) -> Tensor<B, 2> {

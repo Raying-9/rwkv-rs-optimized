@@ -20,6 +20,18 @@ use crate::{
     layers::lora::{ActivationFn, LoRA, LoRAConfig, LoRAType},
 };
 
+#[cfg(feature = "trace")]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {
+        let _rwkv_trace_scope = tracing::trace_span!($name).entered();
+    };
+}
+
+#[cfg(not(feature = "trace"))]
+macro_rules! trace_lite_scope {
+    ($name:literal) => {};
+}
+
 #[derive(Config, Debug)]
 pub struct WeightPrepareConfig {
     num_cells: usize,
@@ -209,11 +221,21 @@ impl<B: Backend> WeightPrepare<B> {
         embedded_token_shift: Option<Tensor<B, 2>>,
         context_mask: Option<Tensor<B, 2>>,
     ) -> WeightPrepareOutput<B> {
-        let prev = token_shift(
-            embedded_context.clone(),
-            embedded_token_shift,
-            context_mask.clone(),
-        );
+        let prev = {
+            let [_, context_length, _] = embedded_context.dims();
+            #[cfg(feature = "trace")]
+            let _token_shift_scope = tracing::trace_span!(
+                "rwkv.infer.model.weight_prepare.token_shift_diff",
+                cell_id = self.cell_id,
+                context_length
+            )
+            .entered();
+            token_shift(
+                embedded_context.clone(),
+                embedded_token_shift,
+                context_mask.clone(),
+            )
+        };
         let mut token_shifted_diff = prev - embedded_context.clone();
         if let Some(mask) = context_mask {
             token_shifted_diff = token_shifted_diff * mask.unsqueeze_dim(2);
@@ -248,23 +270,38 @@ impl<B: Backend> WeightPrepare<B> {
 
         let (num_heads, head_size) = (self.num_heads, self.head_size);
 
-        let scaled_diff_receptance = token_shifted_diff.clone() * self.param_receptance.val();
+        let scaled_diff_receptance = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.scale_diff");
+            token_shifted_diff.clone() * self.param_receptance.val()
+        };
         let scaled_diff_weight_decay = token_shifted_diff.clone() * self.param_weight_decay.val();
         let scaled_diff_key = token_shifted_diff.clone() * self.param_key.val();
         let scaled_diff_value = token_shifted_diff.clone() * self.param_value.val();
         let scaled_diff_learning_rate = token_shifted_diff.clone() * self.param_learning_rate.val();
 
-        let receptance_input = embedded_context.clone() + scaled_diff_receptance;
+        let receptance_input = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.mix_inputs");
+            embedded_context.clone() + scaled_diff_receptance
+        };
         let weight_decay_input = embedded_context.clone() + scaled_diff_weight_decay;
         let key_input = embedded_context.clone() + scaled_diff_key;
         let value_input = embedded_context.clone() + scaled_diff_value;
         let learning_rate_input = embedded_context + scaled_diff_learning_rate;
 
-        let receptance = self.projection_receptance.forward(receptance_input);
+        let receptance = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.projection_receptance");
+            self.projection_receptance.forward(receptance_input)
+        };
 
-        let key_precursor = self.projection_key.forward(key_input);
+        let key_precursor = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.projection_key");
+            self.projection_key.forward(key_input)
+        };
 
-        let value_precursor = self.projection_value.forward(value_input.clone());
+        let value_precursor = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.projection_value");
+            self.projection_value.forward(value_input.clone())
+        };
 
         let value_from_first_cell = if self.cell_id == 0 {
             value_precursor.clone()
@@ -272,42 +309,73 @@ impl<B: Backend> WeightPrepare<B> {
             value_from_first_cell
         };
 
-        let learning_rate = sigmoid(self.param_learning_rate_lora.forward(learning_rate_input));
+        let learning_rate = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.learning_rate_lora");
+            sigmoid(self.param_learning_rate_lora.forward(learning_rate_input))
+        };
 
-        let alpha_modulated =
-            self.param_key_replacement.val() * (learning_rate.clone() - 1.0) + 1.0;
+        let alpha_modulated = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.alpha_modulated");
+            self.param_key_replacement.val() * (learning_rate.clone() - 1.0) + 1.0
+        };
 
-        let replacement_key = key_precursor.clone() * alpha_modulated;
+        let replacement_key = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.replacement_key");
+            key_precursor.clone() * alpha_modulated
+        };
 
         let value = if self.cell_id != 0 {
-            let nu_t = sigmoid(
-                self.param_value_residual_lora
-                    .as_ref()
-                    .unwrap()
-                    .forward(value_input),
-            );
+            let nu_t = {
+                trace_lite_scope!("rwkv.infer.model.weight_prepare.value_residual_lora");
+                sigmoid(
+                    self.param_value_residual_lora
+                        .as_ref()
+                        .unwrap()
+                        .forward(value_input),
+                )
+            };
 
-            lerp(value_precursor, value_from_first_cell.clone(), nu_t)
+            {
+                trace_lite_scope!("rwkv.infer.model.weight_prepare.value_residual_mix");
+                lerp(value_precursor, value_from_first_cell.clone(), nu_t)
+            }
         } else {
             value_precursor
         };
 
-        let weight_decay_lora_result = self.param_weight_decay_lora.forward(weight_decay_input);
+        let weight_decay_lora_result = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.weight_decay_lora");
+            self.param_weight_decay_lora.forward(weight_decay_input)
+        };
 
-        let weight_decay = -softplus(-weight_decay_lora_result, 1.0) - 0.5;
+        let weight_decay = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.weight_decay_post");
+            -softplus(-weight_decay_lora_result, 1.0) - 0.5
+        };
 
-        let removal_key = key_precursor * self.param_key_removal.val();
+        let removal_key = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.removal_key");
+            key_precursor * self.param_key_removal.val()
+        };
 
-        let removal_key_reshaped =
-            removal_key.reshape([batch_size, context_length, num_heads, head_size]);
+        let removal_key_reshaped = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.removal_key_reshape");
+            removal_key.reshape([batch_size, context_length, num_heads, head_size])
+        };
 
-        let removal_key_normalized = -normalize(removal_key_reshaped, 2.0, -1, 1e-12).reshape([
-            batch_size,
-            context_length,
-            embedded_dim,
-        ]);
+        let removal_key_normalized = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.normalize_removal_key");
+            -normalize(removal_key_reshaped, 2.0, -1, 1e-12).reshape([
+                batch_size,
+                context_length,
+                embedded_dim,
+            ])
+        };
 
-        let replacement = -removal_key_normalized.clone() * learning_rate;
+        let replacement = {
+            trace_lite_scope!("rwkv.infer.model.weight_prepare.replacement");
+            -removal_key_normalized.clone() * learning_rate
+        };
 
         WeightPrepareOutput {
             token_shifted_diff,
